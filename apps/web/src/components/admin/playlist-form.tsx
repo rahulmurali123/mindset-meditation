@@ -5,6 +5,7 @@ import { CoverArtField } from '@/components/admin/cover-art-field';
 import { Field, INPUT, uploadCover } from '@/components/admin/upload-form';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { createClient } from '@/lib/supabase/client';
+import { runAction } from '@/lib/run-action';
 import { Loader2, Save, Trash2 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 // Create or edit a playlist — the only way episodes are grouped for listeners.
@@ -71,7 +72,7 @@ export function PlaylistForm({ playlist }: { playlist?: EditablePlaylist }) {
     if (!playlist) return;
     setBusy(true);
     // Episodes survive — only the grouping goes.
-    const res = await adminDeletePlaylist(playlist.id);
+    const res = await runAction(() => adminDeletePlaylist(playlist.id));
     if ('error' in res && res.error) {
       toast.error(res.error);
       setBusy(false);

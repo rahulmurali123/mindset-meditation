@@ -8,9 +8,9 @@
 //   pnpm smtp:test -- --to you@example.com
 //
 import nodemailer from 'nodemailer';
-import { loadEnv } from './_env.mjs';
+import { describeEnv, loadEnv } from './_env.mjs';
 
-loadEnv();
+console.log(describeEnv(loadEnv()));
 
 const args = process.argv.slice(2);
 const to = args[args.indexOf('--to') + 1];

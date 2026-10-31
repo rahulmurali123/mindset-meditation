@@ -1,6 +1,6 @@
 'use client';
 
-import { adminCreatePlaylist, adminUpdatePodcast } from '@/app/actions';
+import { adminCreatePlaylist, adminDiscardUpload, adminUpdatePodcast } from '@/app/actions';
 import { CoverArtField } from '@/components/admin/cover-art-field';
 import { PlatformLinkFields } from '@/components/admin/platform-link-fields';
 import { SeoFields, type SeoOverrides } from '@/components/admin/seo-fields';
@@ -17,7 +17,8 @@ import {
   uploadCover,
 } from '@/components/admin/upload-form';
 import { type PlatformLinks, parsePlatformLinks } from '@/lib/platforms';
-import { formatDuration } from '@/lib/podcast';
+import { MAX_AUDIO_BYTES, TRACK_LIMITS, formatDuration } from '@/lib/podcast';
+import { ACTION_FAILED, runAction } from '@/lib/run-action';
 import { createClient } from '@/lib/supabase/client';
 import { motion } from 'framer-motion';
 import { Info, ListMusic, Loader2, Music, Save } from 'lucide-react';
@@ -73,7 +74,7 @@ export function EditForm({
   );
 
   async function createPlaylist(name: string) {
-    const res = await adminCreatePlaylist({ title: name });
+    const res = await runAction(() => adminCreatePlaylist({ title: name }));
     if ('error' in res && res.error) {
       toast.error(res.error);
       throw new Error(res.error);
@@ -90,14 +91,28 @@ export function EditForm({
       toast.error('Title is required');
       return;
     }
+    if (audio && audio.size > MAX_AUDIO_BYTES) {
+      toast.error(`That file is over the ${MAX_AUDIO_BYTES / 1024 / 1024} MB limit.`);
+      return;
+    }
 
     setBusy(true);
     setPct(0);
+    // Replacement files already in storage, discarded again if the save fails.
+    let uploadedAudio: string | null = null;
+    let uploadedCover: string | null = null;
     try {
+      // Read before any upload starts: when this rejected inside the same
+      // Promise.all as the upload, the save aborted while the transfer carried
+      // on and left an orphaned file behind.
+      const [durationSeconds, blurDataUrl] = await Promise.all([
+        audio ? readDuration(audio) : Promise.resolve(null),
+        cover ? readBlurDataUrl(cover) : Promise.resolve(null),
+      ]);
+
       // Only touch storage when a replacement file was picked. Audio and cover
       // go up together rather than one after the other.
-      const [durationSeconds, audioPath, coverResult, blurDataUrl] = await Promise.all([
-        audio ? readDuration(audio) : Promise.resolve(null),
+      const [audioOutcome, coverOutcome] = await Promise.allSettled([
         audio
           ? uploadAudio(audio, {
               supabaseAccessToken: () => accessToken(supabase),
@@ -106,11 +121,16 @@ export function EditForm({
             })
           : Promise.resolve(null),
         uploadCover(supabase, cover),
-        cover ? readBlurDataUrl(cover) : Promise.resolve(null),
       ]);
+      if (audioOutcome.status === 'fulfilled') uploadedAudio = audioOutcome.value;
+      if (coverOutcome.status === 'fulfilled') uploadedCover = coverOutcome.value.path;
+      if (audioOutcome.status === 'rejected') throw audioOutcome.reason;
+      if (coverOutcome.status === 'rejected') throw coverOutcome.reason;
+      const audioPath = audioOutcome.value;
+      const coverResult = coverOutcome.value;
 
       setProgress('Saving…');
-      const res = await adminUpdatePodcast({
+      const res = await runAction(() => adminUpdatePodcast({
         id: track.id,
         title,
         channel,
@@ -130,8 +150,19 @@ export function EditForm({
               .filter(Boolean)
           : undefined,
         platformLinks,
-      });
-      if ('error' in res && res.error) throw new Error(res.error);
+      }));
+      if ('error' in res && res.error) {
+        // ACTION_FAILED means the call itself failed (proxy timeout, dropped
+        // connection) — the save may still be running and about to commit a
+        // row that points at these files. Only discard on a definite "no".
+        if (res.error === ACTION_FAILED) {
+          uploadedAudio = null;
+          uploadedCover = null;
+        }
+        throw new Error(res.error);
+      }
+      uploadedAudio = null;
+      uploadedCover = null;
       if ('warning' in res && res.warning) toast.warning(res.warning);
 
       toast.success('Changes saved');
@@ -139,6 +170,11 @@ export function EditForm({
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Could not save');
+      if (uploadedAudio || uploadedCover) {
+        await runAction(() =>
+          adminDiscardUpload({ audioPath: uploadedAudio, coverPath: uploadedCover }),
+        );
+      }
     } finally {
       setBusy(false);
       setProgress('');
@@ -148,7 +184,12 @@ export function EditForm({
   return (
     <form className="max-w-2xl space-y-6">
       <Field label="Title *">
-        <input value={title} onChange={(e) => setTitle(e.target.value)} className={INPUT} />
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          maxLength={TRACK_LIMITS.title}
+          className={INPUT}
+        />
       </Field>
 
       <Field label="Channel / Host">
@@ -159,6 +200,7 @@ export function EditForm({
         <textarea
           value={description}
           onChange={(e) => setDescription(e.target.value)}
+          maxLength={TRACK_LIMITS.description}
           rows={4}
           className={INPUT}
         />

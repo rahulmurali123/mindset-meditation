@@ -7,6 +7,7 @@ import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
 import { signAudioUrl } from '@/lib/audio-storage';
 import { requestContext } from '@/lib/request-context';
+import { publicOrigin } from '@/lib/public-origin';
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -42,7 +43,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     // here rather than sent from the client because a browser cannot be trusted
     // to report its own referrer, and because this route already holds the
     // headers — see lib/request-context.ts for what is deliberately not kept.
-    const context = requestContext(req.headers, req.nextUrl.hostname);
+    // Not req.nextUrl.hostname: behind the proxy that is "localhost", which
+    // stopped self-referrals being filtered out.
+    const context = requestContext(req.headers, new URL(publicOrigin(req.headers)).hostname);
     const base = {
       track_id: id,
       user_id: user?.id ?? null,

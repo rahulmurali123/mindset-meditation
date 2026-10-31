@@ -3,6 +3,7 @@
 import { adminDeletePodcast, adminSetStatus } from '@/app/actions';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatDuration } from '@/lib/podcast';
+import { runAction } from '@/lib/run-action';
 import { Eye, EyeOff, ListMusic, Pencil, Trash2 } from 'lucide-react';
 import Link from 'next/link';
 import { useState, useTransition } from 'react';
@@ -21,6 +22,14 @@ export interface ManageRow {
 
 export function ManageList({ rows }: { rows: ManageRow[] }) {
   const [items, setItems] = useState<ManageRow[]>(rows);
+  // useState only reads `rows` once, so after router.refresh() — a new upload,
+  // an edit — the list kept showing the old catalogue. Adopt fresh server rows
+  // whenever the prop itself changes.
+  const [syncedRows, setSyncedRows] = useState(rows);
+  if (rows !== syncedRows) {
+    setSyncedRows(rows);
+    setItems(rows);
+  }
   const [pending, startTransition] = useTransition();
   // The episode awaiting a delete confirmation, or null when the dialog is
   // closed. Holding the row (not just an id) lets the dialog name it.
@@ -28,7 +37,7 @@ export function ManageList({ rows }: { rows: ManageRow[] }) {
 
   function setStatus(id: string, status: 'published' | 'draft') {
     startTransition(async () => {
-      const r = await adminSetStatus(id, status);
+      const r = await runAction(() => adminSetStatus(id, status));
       if ('error' in r) {
         toast.error(r.error);
         return;
@@ -41,7 +50,7 @@ export function ManageList({ rows }: { rows: ManageRow[] }) {
     const row = toDelete;
     if (!row) return;
     startTransition(async () => {
-      const r = await adminDeletePodcast(row.id);
+      const r = await runAction(() => adminDeletePodcast(row.id));
       setToDelete(null);
       if ('error' in r) {
         toast.error(r.error);

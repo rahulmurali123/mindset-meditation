@@ -21,7 +21,7 @@ const outfit = Outfit({
 
 const APP_NAME = BRAND.name;
 const APP_DESCRIPTION = BRAND.description;
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? 'https://themindsetmeditation.app';
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? 'https://themindsetmeditation.com';
 
 export const metadata: Metadata = {
   metadataBase: new URL(APP_URL),

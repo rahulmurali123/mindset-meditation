@@ -1,11 +1,12 @@
 'use client';
 
-import { adminCreatePlaylist, adminCreatePodcast } from '@/app/actions';
+import { adminCreatePlaylist, adminCreatePodcast, adminDiscardUpload } from '@/app/actions';
 import { CoverArtField } from '@/components/admin/cover-art-field';
 import { PlatformLinkFields } from '@/components/admin/platform-link-fields';
 import { SeoFields, type SeoOverrides } from '@/components/admin/seo-fields';
 import type { PlatformLinks } from '@/lib/platforms';
-import { BUCKETS } from '@/lib/podcast';
+import { BUCKETS, MAX_AUDIO_BYTES, TRACK_LIMITS } from '@/lib/podcast';
+import { ACTION_FAILED, runAction } from '@/lib/run-action';
 import { type PodcastClient, createClient } from '@/lib/supabase/client';
 import { cn } from '@/lib/utils';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -22,7 +23,15 @@ export interface PlaylistOption {
   title: string;
 }
 function randomPath(prefix: string, name: string) {
-  const ext = name.split('.').pop() || 'bin';
+  // Same rule as the audio keys minted by /api/admin/upload-url: a filename's
+  // "extension" can hold spaces or anything else, and adminDiscardUpload only
+  // accepts keys made of [\w.-].
+  const ext =
+    name
+      .split('.')
+      .pop()
+      ?.toLowerCase()
+      .replace(/[^a-z0-9]/g, '') || 'bin';
   return `${prefix}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
 }
 
@@ -39,26 +48,70 @@ export function readDuration(file: File): Promise<number> {
     const url = URL.createObjectURL(file);
     const audio = document.createElement('audio');
     audio.preload = 'metadata';
+    let settled = false;
 
-    const fail = (why: string) => {
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      audio.removeAttribute('src');
       URL.revokeObjectURL(url);
-      reject(
-        new Error(`Could not read the audio duration (${why}). Try re-exporting the file as MP3.`),
-      );
+      fn();
     };
 
-    audio.onloadedmetadata = () => {
-      const seconds = audio.duration;
-      URL.revokeObjectURL(url);
+    const fail = (why: string) =>
+      settle(() =>
+        reject(
+          new Error(`Could not read the audio duration (${why}). Try re-exporting the file as MP3.`),
+        ),
+      );
+
+    const finish = (seconds: number) => {
       if (!Number.isFinite(seconds) || seconds < 1) {
-        reject(new Error('That audio file reports no duration. Try re-exporting it as MP3.'));
+        fail('the file reports no length');
         return;
       }
-      resolve(Math.round(seconds));
+      settle(() => resolve(Math.round(seconds)));
+    };
+
+    // A decoder that never answers would otherwise leave the form waiting forever.
+    const timer = setTimeout(() => fail('timed out reading the file'), 20_000);
+
+    audio.onloadedmetadata = () => {
+      // Recorder output (WebM, some M4A) has no duration in its header, so the
+      // browser reports Infinity until it has scanned to the end. Seeking past
+      // the end forces that scan; the real length arrives on the next
+      // timeupdate. Rejecting these files outright blocked perfectly good audio.
+      if (audio.duration === Number.POSITIVE_INFINITY) {
+        audio.ontimeupdate = () => {
+          audio.ontimeupdate = null;
+          finish(audio.duration);
+        };
+        audio.currentTime = Number.MAX_SAFE_INTEGER;
+        return;
+      }
+      finish(audio.duration);
     };
     audio.onerror = () => fail('the browser could not decode it');
     audio.src = url;
   });
+}
+
+/**
+ * Reads a JSON body from one of our own API routes without assuming it is
+ * JSON. A proxy error (nginx 413/502/504) arrives as an HTML page, and
+ * `res.json()` on that surfaced as "Unexpected token <" instead of the status.
+ */
+async function readJson(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return {
+      error: `The server answered ${res.status} ${res.statusText || ''}`.trim() +
+        (res.status === 413 ? ' — the request was too large for the proxy.' : '.'),
+    };
+  }
 }
 
 /**
@@ -255,7 +308,8 @@ export async function uploadAudio(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ filename: file.name, contentType, size: file.size }),
   });
-  const presign = await presignRes.json();
+  // biome-ignore lint/suspicious/noExplicitAny: shape varies by backend, checked below
+  const presign = (await readJson(presignRes)) as any;
   if (!presignRes.ok) throw new Error(presign.error || 'Could not start upload');
 
   if (presign.backend === 'r2' && presign.mode === 'multipart') {
@@ -276,8 +330,8 @@ export async function uploadAudio(
           expectedParts: presign.partUrls.length,
         }),
       });
-      const result = await done.json();
-      if (!done.ok) throw new Error(result.error || 'Could not finalise the upload');
+      const result = await readJson(done);
+      if (!done.ok) throw new Error(String(result.error || 'Could not finalise the upload'));
       return result.audioPath as string;
     } catch (err) {
       // Leaving the upload open would keep R2 billing for the orphaned parts.
@@ -577,10 +631,14 @@ export function UploadForm({
     setCover(null);
     setPlatformLinks({});
     setPct(0);
+    // Both of these used to survive "Upload another", so the next episode was
+    // published with the previous one's meta description and keywords.
+    setSeo({ metaDescription: '', keywords: '' });
+    setAudioDuration(0);
   }
 
   async function createPlaylist(name: string) {
-    const res = await adminCreatePlaylist({ title: name });
+    const res = await runAction(() => adminCreatePlaylist({ title: name }));
     if ('error' in res && res.error) {
       toast.error(res.error);
       throw new Error(res.error);
@@ -605,9 +663,19 @@ export function UploadForm({
       toast.error('Choose a playlist, or create a new one');
       return;
     }
+    if (audio.size > MAX_AUDIO_BYTES) {
+      toast.error(
+        `That file is ${(audio.size / 1024 / 1024).toFixed(0)} MB — the limit is ${MAX_AUDIO_BYTES / 1024 / 1024} MB. Export it at a lower bitrate.`,
+      );
+      return;
+    }
 
     setBusy(true);
     setPct(0);
+    // What has reached storage so far, so a failed save can clean up after
+    // itself instead of leaving the files billed with nothing pointing at them.
+    let uploadedAudio: string | null = null;
+    let uploadedCover: string | null = null;
     try {
       setProgress('Reading audio…');
       // Rejects rather than returning 0, so a file whose duration cannot be
@@ -619,7 +687,7 @@ export function UploadForm({
 
       // The cover is small and goes to a different bucket, so there is no
       // reason to make it wait for the audio the way it used to.
-      const [audioPath, coverResult] = await Promise.all([
+      const [audioResult, coverOutcome] = await Promise.allSettled([
         uploadAudio(audio, {
           supabaseAccessToken: () => accessToken(supabase),
           onStatus: setProgress,
@@ -627,9 +695,15 @@ export function UploadForm({
         }),
         uploadCover(supabase, cover),
       ]);
+      if (audioResult.status === 'fulfilled') uploadedAudio = audioResult.value;
+      if (coverOutcome.status === 'fulfilled') uploadedCover = coverOutcome.value.path;
+      if (audioResult.status === 'rejected') throw audioResult.reason;
+      if (coverOutcome.status === 'rejected') throw coverOutcome.reason;
+      const audioPath = audioResult.value;
+      const coverResult = coverOutcome.value;
 
       setProgress('Saving…');
-      const res = await adminCreatePodcast({
+      const res = await runAction(() => adminCreatePodcast({
         title,
         channel,
         description,
@@ -649,8 +723,19 @@ export function UploadForm({
           : undefined,
         platformLinks,
         publish,
-      });
-      if ('error' in res && res.error) throw new Error(res.error);
+      }));
+      if ('error' in res && res.error) {
+        // ACTION_FAILED means the call itself failed (proxy timeout, dropped
+        // connection) — the save may still be running and about to commit a
+        // row that points at these files. Only discard on a definite "no".
+        if (res.error === ACTION_FAILED) {
+          uploadedAudio = null;
+          uploadedCover = null;
+        }
+        throw new Error(res.error);
+      }
+      uploadedAudio = null;
+      uploadedCover = null;
       if ('warning' in res && res.warning) toast.warning(res.warning);
 
       setDone(publish ? 'Podcast published!' : 'Saved as draft.');
@@ -658,6 +743,11 @@ export function UploadForm({
       router.refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Upload failed');
+      if (uploadedAudio || uploadedCover) {
+        await runAction(() =>
+          adminDiscardUpload({ audioPath: uploadedAudio, coverPath: uploadedCover }),
+        );
+      }
     } finally {
       setBusy(false);
       setProgress('');
@@ -695,6 +785,7 @@ export function UploadForm({
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
+          maxLength={TRACK_LIMITS.title}
           className={INPUT}
           placeholder="e.g. 10-Minute Body Scan for Deep Sleep"
         />
@@ -770,6 +861,7 @@ export function UploadForm({
             <textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
+              maxLength={TRACK_LIMITS.description}
               rows={4}
               className={INPUT}
               placeholder="What's this session about? Who is it for?"

@@ -5,6 +5,7 @@
 import { useState, type FormEvent } from 'react';
 import { Loader2, Send, CheckCircle2, Mail } from 'lucide-react';
 import { sendEnquiry } from '@/app/actions/contact';
+import { runAction } from '@/lib/run-action';
 
 const INPUT =
   'w-full px-3.5 py-2.5 text-sm bg-input border border-border rounded-xl text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary transition-all';
@@ -21,7 +22,7 @@ export function ContactForm() {
     e.preventDefault();
     setError(null);
     setLoading(true);
-    const res = await sendEnquiry({ email, message, website });
+    const res = await runAction(() => sendEnquiry({ email, message, website }));
     setLoading(false);
 
     if (res.error) {

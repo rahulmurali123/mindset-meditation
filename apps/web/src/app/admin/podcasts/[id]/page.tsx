@@ -11,7 +11,7 @@ export default async function EditPodcastPage({ params }: { params: Promise<{ id
   const { id } = await params;
   const supabase = await createClient();
 
-  const [{ data: track }, { data: playlists }, { data: membership }] =
+  const [{ data: track }, { data: playlists }, { data: memberships }] =
     await Promise.all([
       supabase
         .from('tracks')
@@ -25,7 +25,10 @@ export default async function EditPodcastPage({ params }: { params: Promise<{ id
         .select('id, title')
         .is('deleted_at', null)
         .order('created_at', { ascending: false }),
-      supabase.from('playlist_tracks').select('playlist_id').eq('track_id', id).maybeSingle(),
+      // A list, not maybeSingle(): an episode can sit in several playlists, and
+      // maybeSingle() errors on more than one row. That error came back as "no
+      // playlist", and saving the form then removed the episode from all of them.
+      supabase.from('playlist_tracks').select('playlist_id').eq('track_id', id),
     ]);
 
   if (!track) notFound();
@@ -48,7 +51,9 @@ export default async function EditPodcastPage({ params }: { params: Promise<{ id
       <EditForm
         // biome-ignore lint/suspicious/noExplicitAny: untyped podcast schema row
         track={track as any}
-        currentPlaylistId={(membership as { playlist_id?: string } | null)?.playlist_id ?? ''}
+        currentPlaylistId={
+          ((memberships ?? []) as Array<{ playlist_id: string }>)[0]?.playlist_id ?? ''
+        }
         playlists={(playlists ?? []) as PlaylistOption[]}
       />
     </div>

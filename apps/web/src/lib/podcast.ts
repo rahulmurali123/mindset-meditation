@@ -9,6 +9,21 @@ export const BUCKETS = {
 } as const;
 
 /**
+ * Text limits on podcast.tracks, mirrored from its CHECK constraints in
+ * fullschema.sql. The form enforces them as maxLength and the actions clamp to
+ * them, because a constraint violation is only discovered on the final insert —
+ * after the whole audio file has already been uploaded.
+ */
+export const TRACK_LIMITS = {
+  title: 255,
+  description: 5000,
+  metaDescription: 320,
+} as const;
+
+/** Largest audio file accepted, matching the podcast-audio bucket's limit. */
+export const MAX_AUDIO_BYTES = 200 * 1024 * 1024;
+
+/**
  * The subset of `tracks` every episode surface needs: cards, the hero player,
  * episode rows. Four near-identical shapes used to be declared separately in
  * page.tsx, podcast-card.tsx, now-playing-card.tsx and here, which meant adding

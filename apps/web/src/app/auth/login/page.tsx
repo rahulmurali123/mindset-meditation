@@ -14,6 +14,7 @@ import {
 } from '@/components/auth/auth-shell';
 import { BRAND } from '@/lib/brand';
 import { signInAction } from '@/app/auth/actions';
+import { runAction } from '@/lib/run-action';
 import { toast } from 'sonner';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -55,7 +56,7 @@ function LoginForm() {
     setError(null);
     setLoading(true);
 
-    const res = await signInAction({ identifier, password, remember });
+    const res = await runAction(() => signInAction({ identifier, password, remember }));
 
     if (res.error) {
       setError({ message: res.error, field: res.field });

@@ -4,10 +4,9 @@
 import type { Metadata } from 'next';
 import { BRAND } from '@/lib/brand';
 import type { ResolvedPlatform } from '@/lib/platforms';
+import { SITE_URL } from '@/lib/public-origin';
 
-export const SITE_URL = (
-  process.env.NEXT_PUBLIC_APP_URL ?? 'https://themindsetmeditation.app'
-).replace(/\/$/, '');
+export { SITE_URL };
 
 function canonical(path = '/'): string {
   return `${SITE_URL}${path.startsWith('/') ? path : `/${path}`}`;

@@ -7,7 +7,7 @@ runs on Hostinger VPS, any Linux box, or Docker — no Vercel lock-in.
 
 ## 1. Requirements on the server
 
-- **Node.js 20+** (`node -v`)
+- **Node.js 22+** (`node -v`) — the locked `@supabase/*` packages require 22
 - **pnpm 9+** (`corepack enable && corepack prepare pnpm@9.15.4 --activate`)
 - A reverse proxy for TLS (Nginx / Caddy / Hostinger's panel)
 
@@ -18,9 +18,13 @@ runs on Hostinger VPS, any Linux box, or Docker — no Vercel lock-in.
 
 ## 2. Environment variables
 
-All environment config lives in a **single `.env` at the repo root** — there is
-deliberately none inside `apps/`. Copy `.env.example` to `.env` and fill it in.
-The app reads four variables at runtime:
+All environment config lives at the **repo root** — there is deliberately none
+inside `apps/`. On the server use **`.env.production`** (copy `.env.example` and
+fill it in): the build reads it for the `NEXT_PUBLIC_*` values it bakes in, and
+the systemd unit below reads the same file at runtime, so the two can never
+disagree. Precedence, highest first: real environment variables, `.env.local`,
+`.env.production` (production builds only), `.env`. A blank value never
+overrides anything.
 
 | Variable | Required | Notes |
 |---|---|---|
@@ -29,8 +33,13 @@ The app reads four variables at runtime:
 | `SUPABASE_SERVICE_ROLE_KEY` | yes | **Server-only.** Never prefix `NEXT_PUBLIC_` |
 | `NEXT_PUBLIC_APP_URL` | yes | **Your own domain**, not Supabase. `https://yourdomain.com`, no trailing slash. Drives canonical tags, sitemap and Open Graph — leave it as localhost and Google indexes the wrong host |
 | `ADMIN_VERIFICATION_CODE` | yes | Second factor for `/admin`. Any text you choose. Fails closed if unset |
+| `SMTP_HOST` `SMTP_PORT` `SMTP_USER` `SMTP_PASS` `SMTP_FROM` | yes | Password-reset and contact-form email. Gmail: `smtp.gmail.com`, port `587`, a 16-character **App Password** (needs 2-Step Verification), `SMTP_FROM` = that Gmail address. Check with `pnpm smtp:test -- --to you@example.com` |
+| `SMTP_SECURE` | no | Derived from the port (465 → `true`, otherwise `false`). Only set it to override |
 | `SUPABASE_DB_URL` | no | Raw Postgres connection. **Nothing in the project requires it** — kept only if you want to run SQL from a terminal instead of the dashboard |
 | `R2_*` (four) | no | Leave blank to store audio in Supabase Storage; fill all four for Cloudflare R2 (see 2b) |
+
+`NEXT_PUBLIC_*` values are compiled into the build — change one and you must
+rebuild, not just restart. Everything else is read when the server starts.
 
 ### Why two Supabase URLs?
 
@@ -121,6 +130,37 @@ get immediate confirmation. Existing Supabase-stored episodes keep playing;
 
 ## 3. Build and run
 
+### The normal way: `scripts/deploy.sh`
+
+Once the server is set up (systemd unit and nginx below), every deploy is one
+command, run on the server from inside the checkout:
+
+```bash
+./scripts/deploy.sh
+```
+
+It refuses to start on Node < 22, a missing env file or local edits; then
+pulls `main`, installs, builds **beside** the live release (the site keeps
+serving during the build), copies `public/` and `static/` into place, swaps the
+new release in, restarts the `mindset` unit and polls `/api/health`:
+
+- **healthy** → done.
+- **no answer** → the new build is broken: it rolls back to the previous
+  release automatically and tells you where the logs are.
+- **answers 503** → the build runs but a dependency is misconfigured (most
+  often the Supabase schema exposure — see §4). The new build stays up and the
+  failing checks are printed.
+
+Override with `BRANCH=…`, `SERVICE=…` or `PORT=…` if yours differ.
+
+> Do not run `pnpm build` by hand inside the live checkout. `next build` empties
+> `apps/web/.next` first — including the running server's files — so the live
+> site serves 404s for its scripts until the build finishes. It also rewrites
+> the tracked `apps/web/next-env.d.ts` and `tsconfig.json`, which then blocks
+> the next `git pull`. The script handles both.
+
+### What the script does, by hand
+
 ```bash
 pnpm install --frozen-lockfile
 pnpm --filter @mindset/web build
@@ -133,13 +173,13 @@ server before it will run — Next does not copy them for you:
 # run these from the repo root — the paths matter
 cp -R apps/web/public       apps/web/.next/standalone/apps/web/public
 cp -R apps/web/.next/static apps/web/.next/standalone/apps/web/.next/static
-cp .env                     apps/web/.next/standalone/apps/web/.env
+cp .env.production          apps/web/.next/standalone/apps/web/.env.production
 
 cd apps/web/.next/standalone/apps/web
 PORT=3100 HOSTNAME=127.0.0.1 node server.js
 ```
 
-> **The `.env` copy is not optional.** `next.config.ts` reads the root `.env` at
+> **The env file copy is not optional.** `next.config.ts` reads the root env files at
 > *build* time, which is enough to inline `NEXT_PUBLIC_*` into the client
 > bundle — but the standalone server is a separate process that never evaluates
 > `next.config.ts`. Server-only secrets (`SUPABASE_SERVICE_ROLE_KEY`,
@@ -203,6 +243,41 @@ Do **not** add security headers in Nginx — `next.config.ts` already sends CSP,
 HSTS, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy` and
 `Permissions-Policy`. Duplicating them causes conflicts.
 
+`proxy_set_header Host $host` is required, not decoration: server actions
+(sign-in, sign-up, every admin save) compare the browser's `Origin` against
+it and reject the request when they differ.
+
+**Serve one host only.** Sign-in cookies belong to the exact host that set
+them, so someone signed in on `www.` is signed out on the bare domain. Send
+`www` to the apex permanently (adjust the certificate paths to yours —
+`certbot --nginx -d themindsetmeditation.com -d www.themindsetmeditation.com`
+issues one that covers both):
+
+```nginx
+server {
+  listen 443 ssl;
+  server_name www.themindsetmeditation.com;
+  ssl_certificate     /etc/letsencrypt/live/themindsetmeditation.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/themindsetmeditation.com/privkey.pem;
+  return 301 https://themindsetmeditation.com$request_uri;
+}
+```
+
+### Health check
+
+```bash
+curl -s http://127.0.0.1:3100/api/health
+# {"ok":true,"checks":{"schema":true,"serviceRole":true,"auth":true,"adminCode":true,"r2":true,"smtp":true}}
+```
+
+Booleans only, safe to expose. `ok` is false (HTTP 503) when sign-in and
+uploads cannot work: `schema` (the `podcast` schema is reachable through the
+Data API), `serviceRole` (the service key works), `auth` (Supabase Auth is up)
+or `adminCode` (`ADMIN_VERIFICATION_CODE` is set). `r2` and `smtp` report
+configuration only and never fail the probe. The reason for any `false` is in
+the server log: `sudo journalctl -u mindset -n 100`. Point an uptime monitor
+at `https://themindsetmeditation.com/api/health`.
+
 ---
 
 ## 4. Database
@@ -213,15 +288,36 @@ are no incremental migration files — that one file is the source of truth.
 **Set up a database:**
 1. Supabase Dashboard → **SQL Editor** → paste all of `fullschema.sql` → **Run**
    (or `psql "$SUPABASE_DB_URL" -f fullschema.sql`)
-2. Check **Settings → API → Exposed schemas** lists `podcast` — the script sets
-   this automatically, but some projects restrict `ALTER ROLE`
+2. **Supabase Dashboard → Project Settings → Data API → Exposed schemas:** add
+   `podcast` and **Save** — even if it already appears in the list.
+
+   The script exposes it immediately with `ALTER ROLE`, but on hosted Supabase
+   the dashboard value is the one that lasts. The next time the API config is
+   reloaded (pausing and resuming the project, a platform restart, any save on
+   that page) it is replaced by the dashboard's list. When that happened in
+   production, everything that touches the database broke at once: admins were
+   treated as listeners, username sign-in said "wrong password", and every
+   upload failed — while the cached homepage still looked fine.
+   `/api/health` reports `"schema": false` until this is right.
 3. Create the first admin:
    ```bash
-   pnpm seed:admin -- --email you@example.com --password 'a-strong-password'
+   pnpm seed:admin -- --email you@example.com --password 'a-strong-password' --username admin
    ```
+   `--username` is optional; it is what the admin types when signing in by
+   username instead of email. Re-running it resets the password.
 
 It creates the schema, all 9 tables, indexes, functions, triggers, row-level
 security, the storage buckets and their policies, and the seed categories.
+
+**Bringing an existing database up to date:** check where it is, then run each
+newer file in `migrations/` in order (they are safe to re-run):
+
+```sql
+SELECT version FROM podcast.schema_migrations ORDER BY version DESC LIMIT 5;
+```
+
+The current code needs **036**: deleting an episode fails on an older
+database.
 
 **Changing the schema later:** edit the database directly (dashboard SQL Editor),
 then regenerate `fullschema.sql` so it stays in step. On a database that already
@@ -240,10 +336,16 @@ SUPABASE_DB_URL=postgresql://postgres.<project-ref>:<password>@aws-0-<region>.po
 
 ## 5. Pre-launch checklist
 
-- [ ] `NEXT_PUBLIC_APP_URL` is the real domain (drives canonicals, sitemap, OG)
+- [ ] Node 22+ on the server
+- [ ] `NEXT_PUBLIC_APP_URL` is the real domain (drives canonicals, sitemap, OG,
+      reset links and the host every redirect is allowed to point at)
 - [ ] Rotate `ADMIN_PASSWORD` off the default and rotate the Postgres password
 - [ ] Confirm `.env*` files are gitignored (they are) and never committed
-- [ ] `fullschema.sql` has been run and `podcast` is in Settings → API → Exposed schemas
+- [ ] `fullschema.sql` (or every pending migration) has been run, and `podcast`
+      is saved under Project Settings → Data API → Exposed schemas
+- [ ] `curl -s https://themindsetmeditation.com/api/health` returns `"ok":true`
+- [ ] `www` redirects to the apex domain (§3, Nginx)
+- [ ] `pnpm smtp:test -- --to you@example.com` delivers
 - [ ] Supabase → Auth → set **Site URL** and **Redirect URLs** to your domain,
       or email confirmation links will point at localhost
 - [ ] Decide on email confirmation (Auth → Sign In / Providers → "Confirm email")

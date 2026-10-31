@@ -16,10 +16,17 @@
 // is also the way back in if the admin password is lost.
 //
 //   pnpm seed:admin -- --email you@example.com --password 'S3cret!'
+//   pnpm seed:admin -- --email you@example.com --password '…' --username admin
 //   pnpm seed:admin                      # prompts for anything omitted
-import { loadEnv } from './_env.mjs';
+//
+// --username is optional. Without it the signup trigger derives one
+// ("administrator"), which is what the admin must type when signing in by
+// username rather than by email.
+import { describeEnv, loadEnv } from './_env.mjs';
 
-loadEnv();
+// Printed first: this script resets a password, so it must be obvious which
+// project it is about to touch.
+console.log(describeEnv(loadEnv()));
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -70,6 +77,7 @@ function ask(question, { hidden = false } = {}) {
 
 const email = arg('email') || (await ask('Admin email: '));
 const password = arg('password') || (await ask('Admin password (hidden): ', { hidden: true }));
+const username = arg('username')?.trim().toLowerCase();
 
 if (!SUPABASE_URL || !SERVICE_ROLE) {
   console.error('❌ Missing NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY in .env');
@@ -78,6 +86,11 @@ if (!SUPABASE_URL || !SERVICE_ROLE) {
 if (!email || !password) {
   console.error('❌ An email and password are required');
   console.error("   pnpm seed:admin -- --email you@example.com --password 'S3cret!'");
+  process.exit(1);
+}
+// Same rule the sign-up form enforces (USERNAME_RE in app/auth/actions.ts).
+if (username !== undefined && !/^[a-z0-9_]{3,20}$/.test(username)) {
+  console.error('❌ --username must be 3–20 characters: letters, numbers or underscores.');
   process.exit(1);
 }
 if (password.length < 12) {
@@ -107,10 +120,21 @@ async function gotrue(path, opts = {}) {
 }
 
 async function findUser(targetEmail) {
-  const res = await gotrue('/auth/v1/admin/users?per_page=200');
-  if (!res.ok) return null;
-  const users = Array.isArray(res.json) ? res.json : res.json?.users || [];
-  return users.find((u) => (u.email || '').toLowerCase() === targetEmail.toLowerCase()) || null;
+  // Paged: reading only the first page missed the admin once the site had more
+  // than 200 accounts, and the create below then failed with "already registered".
+  const target = targetEmail.toLowerCase();
+  const perPage = 200;
+  for (let page = 1; ; page++) {
+    const res = await gotrue(`/auth/v1/admin/users?page=${page}&per_page=${perPage}`);
+    if (!res.ok) {
+      console.error('❌ could not list users:', res.status, res.json);
+      process.exit(1);
+    }
+    const users = Array.isArray(res.json) ? res.json : res.json?.users || [];
+    const match = users.find((u) => (u.email || '').toLowerCase() === target);
+    if (match) return match;
+    if (users.length < perPage) return null;
+  }
 }
 
 async function main() {
@@ -138,7 +162,7 @@ async function main() {
         email,
         password,
         email_confirm: true,
-        user_metadata: { full_name: 'Administrator' },
+        user_metadata: { full_name: 'Administrator', ...(username ? { username } : {}) },
       }),
     });
     if (!res.ok) {
@@ -158,13 +182,20 @@ async function main() {
       'Content-Profile': 'podcast',
       Prefer: 'return=representation',
     },
-    body: JSON.stringify({ role: 'admin' }),
+    body: JSON.stringify({ role: 'admin', ...(username ? { username } : {}) }),
   });
   const patched = await patch.json().catch(() => null);
 
   if (!patch.ok) {
     console.error('❌ could not grant the admin role:', patch.status, patched);
-    console.error('   Has fullschema.sql been run, and is "podcast" an exposed schema?');
+    if (patched?.code === 'PGRST106') {
+      console.error('   "podcast" is not an exposed schema. Supabase Dashboard -> Project Settings');
+      console.error('   -> Data API -> Exposed schemas: add "podcast" and save, then re-run this.');
+    } else if (patched?.code === '23505') {
+      console.error(`   The username "${username}" is already taken by another account.`);
+    } else {
+      console.error('   Has fullschema.sql been run, and is "podcast" an exposed schema?');
+    }
     process.exit(1);
   }
   if (!Array.isArray(patched) || patched.length === 0) {
@@ -174,7 +205,7 @@ async function main() {
   }
   console.log(`✅ admin role granted (role=${patched[0].role})`);
 
-  console.log(`\n   Admin login → ${email}  (the password you just entered)`);
+  console.log(`\n   Admin login → ${email} or username "${patched[0].username}"  (the password you just entered)`);
   console.log('   Signing in also requires ADMIN_VERIFICATION_CODE from .env\n');
 }
 

@@ -4,6 +4,7 @@ import { useMemo, useState, useTransition, type FormEvent } from 'react';
 import { Trash2, Send, CornerDownRight, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
 import { addComment, deleteComment } from '@/app/actions';
+import { runAction } from '@/lib/run-action';
 import { buildThreads, formatCommentDate, removeWithReplies } from '@/lib/comments';
 import { cn } from '@/lib/utils';
 
@@ -53,7 +54,7 @@ export function Comments({
 
   function post(body: string, parentId: string | null, onDone: () => void) {
     startTransition(async () => {
-      const res = await addComment(trackId, body, parentId);
+      const res = await runAction(() => addComment(trackId, body, parentId));
       if ('error' in res && res.error) {
         toast.error(res.error);
         return;
@@ -82,7 +83,7 @@ export function Comments({
 
   function remove(id: string) {
     startTransition(async () => {
-      const res = await deleteComment(id);
+      const res = await runAction(() => deleteComment(id));
       if ('error' in res && res.error) {
         toast.error(res.error);
         return;

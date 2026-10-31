@@ -9,6 +9,7 @@ import { BRAND } from '@/lib/brand';
 import { verifyAdminCodeAction } from '@/app/auth/actions';
 import { toast } from 'sonner';
 import { safeRedirect } from '@/lib/safe-redirect';
+import { runAction } from '@/lib/run-action';
 
 function VerifyForm() {
   const searchParams = useSearchParams();
@@ -23,7 +24,7 @@ function VerifyForm() {
     setError(null);
     setLoading(true);
 
-    const res = await verifyAdminCodeAction({ code });
+    const res = await runAction(() => verifyAdminCodeAction({ code }));
     if (res.error) {
       setError(res.error);
       setCode('');

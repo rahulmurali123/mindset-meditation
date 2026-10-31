@@ -2,7 +2,7 @@
 
 import { deleteAudio } from '@/lib/audio-storage';
 import { PLATFORMS, type PlatformLinks, sanitizePlatformUrl } from '@/lib/platforms';
-import { BUCKETS, slugify, uniqueSlug } from '@/lib/podcast';
+import { BUCKETS, TRACK_LIMITS, slugify, uniqueSlug } from '@/lib/podcast';
 import { generateEpisodeMetadata } from '@/lib/seo/generate';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
@@ -62,7 +62,13 @@ async function insertWithUniqueSlug<T extends { id: string; slug: string }>(
   const admin = createAdminClient();
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    const { data: existing } = await admin.from(table).select('slug').like('slug', `${base}%`);
+    const { data: existing, error: lookupError } = await admin
+      .from(table)
+      .select('slug')
+      .like('slug', `${base}%`);
+    // Treating a failed lookup as "no collisions" proposes the same taken slug
+    // on every attempt and ends in a misleading "no free URL" message.
+    if (lookupError) return { data: null, error: schemaHint(lookupError.message) };
 
     const slug = uniqueSlug(
       title,
@@ -205,7 +211,17 @@ export async function deleteComment(id: string) {
  * caching glitch. It almost always means the database is a migration behind
  * the app, so say that instead of leaving the admin to guess.
  */
+/** Keeps a meta description inside tracks_meta_description_check. */
+function clampMeta(text: string): string {
+  return text.length > TRACK_LIMITS.metaDescription
+    ? text.slice(0, TRACK_LIMITS.metaDescription).trimEnd()
+    : text;
+}
+
 function schemaHint(message: string): string {
+  if (/invalid schema/i.test(message)) {
+    return `${message}\n\nSupabase is not exposing the "podcast" schema. Supabase Dashboard → Project Settings → Data API → Exposed schemas: add "podcast" and save.`;
+  }
   const behind = /schema cache|could not find the|does not exist/i.test(message);
   return behind
     ? `${message}\n\nThe database looks a migration behind the app. Check its version with \`SELECT version FROM podcast.schema_migrations ORDER BY version DESC LIMIT 1\` and apply the pending file — see migrations/README.md.`
@@ -300,7 +316,11 @@ type AdminGate = { error: string; userId?: never } | { error?: never; userId: st
 async function requireAdmin(): Promise<AdminGate> {
   const admin = await checkAdmin();
   if (admin.ok && admin.userId) return { userId: admin.userId };
-  return { error: admin.reason === 'unauthenticated' ? 'Please sign in' : 'Not authorised' };
+  if (admin.reason === 'unauthenticated') return { error: 'Please sign in' };
+  if (admin.reason === 'unavailable') {
+    return { error: 'The database could not be reached. Please try again in a moment.' };
+  }
+  return { error: 'Not authorised' };
 }
 
 export interface PlaylistInput {
@@ -414,6 +434,72 @@ export async function adminDeletePlaylist(id: string) {
   return { ok: true };
 }
 
+/**
+ * Removes stored media, from whichever backend holds it. Never throws: returns
+ * a description of anything left behind so the caller can surface it as a
+ * warning rather than failing an operation that otherwise succeeded.
+ */
+async function removeStoredFiles(audioPath?: string | null, coverPath?: string | null) {
+  const leftovers: string[] = [];
+
+  if (audioPath) {
+    const failed = await deleteAudio(audioPath);
+    if (failed) leftovers.push(`audio (${failed})`);
+  }
+
+  if (coverPath) {
+    const admin = createAdminClient();
+    const { error } = await admin.storage.from(BUCKETS.thumbnails).remove([coverPath]);
+    if (error) leftovers.push(`cover image (${error.message})`);
+  }
+
+  return leftovers;
+}
+
+/**
+ * Deletes files the upload form put in storage for an episode that then failed
+ * to save — otherwise every failed save left a full audio file billed in R2.
+ *
+ * Only paths the upload flow itself mints are accepted, and only while no
+ * episode row refers to them, so this can't be pointed at a live episode.
+ */
+export async function adminDiscardUpload(input: {
+  audioPath?: string | null;
+  coverPath?: string | null;
+}) {
+  const gate = await requireAdmin();
+  if (gate.error) return { error: gate.error };
+
+  const audioPath =
+    typeof input?.audioPath === 'string' && /^(r2|sb):podcasts\/[\w.-]+$/.test(input.audioPath)
+      ? input.audioPath
+      : null;
+  const coverPath =
+    typeof input?.coverPath === 'string' && /^covers\/[\w.-]+$/.test(input.coverPath)
+      ? input.coverPath
+      : null;
+  if (!audioPath && !coverPath) return { ok: true };
+
+  const admin = createAdminClient();
+  // Older rows store R2 keys bare ("podcasts/…"), which still mean R2 — check
+  // that form too, or a legacy episode's audio would look unused.
+  const filters = [
+    audioPath ? `audio_path.eq."${audioPath}"` : null,
+    audioPath?.startsWith('r2:') ? `audio_path.eq."${audioPath.slice(3)}"` : null,
+    coverPath ? `thumbnail_path.eq."${coverPath}"` : null,
+  ].filter(Boolean);
+  const { data: inUse, error } = await admin
+    .from('tracks')
+    .select('id')
+    .or(filters.join(','))
+    .limit(1);
+  if (error) return { error: error.message };
+  if (inUse && inUse.length > 0) return { error: 'Those files belong to an existing episode' };
+
+  await removeStoredFiles(audioPath, coverPath);
+  return { ok: true };
+}
+
 interface CreatePodcastInput {
   title: string;
   channel?: string;
@@ -446,6 +532,12 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
 
   const title = input.title.trim();
   if (!title) return { error: 'Title is required' };
+  if (title.length > TRACK_LIMITS.title) {
+    return { error: `Title must be at most ${TRACK_LIMITS.title} characters` };
+  }
+  if ((input.description?.trim().length ?? 0) > TRACK_LIMITS.description) {
+    return { error: `Description must be at most ${TRACK_LIMITS.description} characters` };
+  }
   if (!input.audioPath) return { error: 'Audio file is required' };
   // A 0 here would be clamped to 1 second and silently ship a broken episode;
   // the form blocks submission, and this is the server-side backstop.
@@ -455,14 +547,17 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
 
   // The playlist title feeds the generated copy, so fetch it before generating.
   let playlistTitle: string | null = null;
+  let playlistSlug: string | null = null;
   if (input.playlistId) {
     const { data: pl } = await supabase
       .from('playlists')
-      .select('title')
+      .select('title, slug')
       .eq('id', input.playlistId)
       .maybeSingle();
     playlistTitle = pl?.title ?? null;
+    playlistSlug = (pl as { slug?: string | null } | null)?.slug ?? null;
   }
+  const playlistSlugs = playlistSlug ? [playlistSlug] : [];
 
   const durationSeconds = Math.round(input.durationSeconds);
   const description = input.description?.trim() || null;
@@ -480,7 +575,7 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
     // now a sentence-boundary excerpt rather than a mid-word .slice(0, 300).
     short_description: generated.excerpt.slice(0, 300),
     excerpt: generated.excerpt,
-    meta_description: input.metaDescription?.trim() || generated.metaDescription,
+    meta_description: clampMeta(input.metaDescription?.trim() || generated.metaDescription),
     keywords: input.keywords?.length ? input.keywords : generated.keywords,
     duration_seconds: durationSeconds,
     audio_url: input.audioPath,
@@ -526,7 +621,7 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
     revalidatePath('/playlists');
   }
 
-  revalidateEpisode(data.slug);
+  revalidateEpisode(data.slug, playlistSlugs);
   return { podcast: data };
 }
 
@@ -559,13 +654,19 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
 
   const title = input.title.trim();
   if (!title) return { error: 'Title is required' };
+  if (title.length > TRACK_LIMITS.title) {
+    return { error: `Title must be at most ${TRACK_LIMITS.title} characters` };
+  }
+  if ((input.description?.trim().length ?? 0) > TRACK_LIMITS.description) {
+    return { error: `Description must be at most ${TRACK_LIMITS.description} characters` };
+  }
 
   // The generated copy is derived from title + playlist + duration, so it has
   // to be recomputed on edit or an episode keeps the description of its old
   // title. The slug is deliberately NOT regenerated — see below.
   const { data: current } = await supabase
     .from('tracks')
-    .select('duration_seconds, published_at, status')
+    .select('duration_seconds, published_at, status, audio_path, thumbnail_path')
     .eq('id', input.id)
     .maybeSingle();
 
@@ -573,7 +674,13 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
     duration_seconds: number;
     published_at: string | null;
     status: string;
+    audio_path: string | null;
+    thumbnail_path: string | null;
   } | null;
+
+  // Playlist pages the episode was on before this edit; a move must purge both
+  // the old page and the new one.
+  const previousPlaylistSlugs = await playlistSlugsForTrack(supabase, input.id);
 
   let playlistTitle: string | null = null;
   if (input.playlistId) {
@@ -604,7 +711,7 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
     description,
     short_description: generated.excerpt.slice(0, 300),
     excerpt: generated.excerpt,
-    meta_description: input.metaDescription?.trim() || generated.metaDescription,
+    meta_description: clampMeta(input.metaDescription?.trim() || generated.metaDescription),
     keywords: input.keywords?.length ? input.keywords : generated.keywords,
     instructor_name: input.channel?.trim() || null,
   };
@@ -669,6 +776,7 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
           position: count ?? 0,
         });
         if (linkError) {
+          revalidateEpisode(data.slug, previousPlaylistSlugs);
           return {
             podcast: data,
             warning: `Saved, but playlist move failed: ${linkError.message}`,
@@ -678,9 +786,27 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
     }
   }
 
+  // The row now points at the replacement media, so the files it used to point
+  // at belong to nothing. Removed only after the update succeeded — a failed
+  // save must leave the episode playing its original audio.
+  const replacedAudio =
+    input.audioPath && existingTrack?.audio_path !== input.audioPath
+      ? existingTrack?.audio_path
+      : null;
+  const replacedCover =
+    input.coverUrl && existingTrack?.thumbnail_path !== (input.coverPath ?? null)
+      ? existingTrack?.thumbnail_path
+      : null;
+  const leftovers = await removeStoredFiles(replacedAudio, replacedCover);
+
   revalidatePath('/playlists');
-  revalidateEpisode(data.slug);
-  return { podcast: data };
+  revalidateEpisode(data.slug, [
+    ...previousPlaylistSlugs,
+    ...(await playlistSlugsForTrack(supabase, input.id)),
+  ]);
+  return leftovers.length > 0
+    ? { podcast: data, warning: `Saved, but could not remove the old ${leftovers.join(' and ')}.` }
+    : { podcast: data };
 }
 
 export async function adminSetStatus(id: string, status: 'draft' | 'published' | 'archived') {
@@ -754,26 +880,22 @@ export async function adminDeletePodcast(id: string) {
   // join rows cascade away with the track.
   const playlistSlugs = await playlistSlugsForTrack(supabase, id);
 
-  const { error } = await supabase.from('tracks').delete().eq('id', id);
+  const { data: deleted, error } = await supabase
+    .from('tracks')
+    .delete()
+    .eq('id', id)
+    .select('id');
   if (error) return { error: error.message };
+  // RLS turns a disallowed delete into "0 rows", not an error. Deleting the
+  // files on that basis would leave a live episode with no audio.
+  if (!deleted || deleted.length === 0) {
+    return { error: 'That episode could not be deleted — it may already be gone.' };
+  }
 
   // Files second, and never fatal: the episode is already gone from the site,
   // so failing here would report a delete that plainly did happen as an error.
   // A leftover file is reported as a warning instead of vanishing silently.
-  const leftovers: string[] = [];
-
-  if (track?.audio_path) {
-    const failed = await deleteAudio(track.audio_path);
-    if (failed) leftovers.push(`audio (${failed})`);
-  }
-
-  if (track?.thumbnail_path) {
-    const admin = createAdminClient();
-    const { error: coverError } = await admin.storage
-      .from(BUCKETS.thumbnails)
-      .remove([track.thumbnail_path]);
-    if (coverError) leftovers.push(`cover image (${coverError.message})`);
-  }
+  const leftovers = await removeStoredFiles(track?.audio_path, track?.thumbnail_path);
 
   revalidateEpisode(track?.slug, playlistSlugs);
 

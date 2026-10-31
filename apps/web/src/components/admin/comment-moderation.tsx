@@ -1,6 +1,7 @@
 'use client';
 
 import { addComment, deleteComment } from '@/app/actions';
+import { runAction } from '@/lib/run-action';
 import {
   type CommentRow,
   buildThreads,
@@ -38,7 +39,7 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
     if (!body) return;
 
     startTransition(async () => {
-      const res = await addComment(root.trackId, body, root.id);
+      const res = await runAction(() => addComment(root.trackId, body, root.id));
       if ('error' in res && res.error) {
         toast.error(res.error);
         return;
@@ -65,7 +66,7 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
 
   function remove(id: string) {
     startTransition(async () => {
-      const res = await deleteComment(id);
+      const res = await runAction(() => deleteComment(id));
       if ('error' in res && res.error) {
         toast.error(res.error);
         return;

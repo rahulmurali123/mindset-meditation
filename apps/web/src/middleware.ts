@@ -5,8 +5,9 @@
 import { type NextRequest, NextResponse } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 import { ADMIN_COOKIE } from '@/lib/admin-verify';
+import { publicUrl } from '@/lib/public-origin';
 import type { PodcastDatabase } from '@/lib/supabase/types';
-import { SESSION_ONLY_COOKIE, applySessionOnly , type CookieOptions } from '@/lib/supabase/cookie-options';
+import { SESSION_ONLY_COOKIE, applySessionOnly, type CookieOptions } from '@/lib/supabase/cookie-options';
 
 /**
  * Supabase stores its session in cookies named `sb-<project-ref>-auth-token`,
@@ -64,25 +65,46 @@ export async function middleware(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
+  /**
+   * A redirect built on the visitor's real origin — see lib/public-origin.ts
+   * for why request.nextUrl can't be used — that also carries any session
+   * cookies getUser() just refreshed. Dropping those would leave the browser
+   * holding a refresh token Supabase has already rotated away.
+   */
+  function redirect(pathname: string, params?: Record<string, string>) {
+    const res = NextResponse.redirect(publicUrl(request.headers, pathname, params));
+    for (const cookie of response.cookies.getAll()) res.cookies.set(cookie);
+    return res;
+  }
+
   if (isAdminPage || isAdminApi) {
     if (!user) {
       if (isAdminApi) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
       }
-      const url = request.nextUrl.clone();
-      url.pathname = '/auth/login';
-      url.searchParams.set('redirect', path);
-      return NextResponse.redirect(url);
+      return redirect('/auth/login', { redirect: path });
     }
 
-    const { data: role } = await supabase.rpc('get_user_role', { p_user_id: user.id });
+    const { data: role, error: roleError } = await supabase.rpc('get_user_role', {
+      p_user_id: user.id,
+    });
+    // A failed lookup is an outage, not an answer. Treating it as "not an admin"
+    // silently bounced the real admin to the homepage whenever Supabase could
+    // not be reached — or the podcast schema was not exposed to its API.
+    if (roleError) {
+      console.error('[middleware] get_user_role failed:', roleError.code, roleError.message);
+      return isAdminApi
+        ? NextResponse.json({ error: 'Service unavailable' }, { status: 503 })
+        : new NextResponse('Admin is temporarily unavailable. Please try again shortly.', {
+            status: 503,
+            headers: { 'content-type': 'text/plain; charset=utf-8', 'retry-after': '30' },
+          });
+    }
     if (role !== 'admin' && role !== 'super_admin') {
       if (isAdminApi) {
         return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
       }
-      const url = request.nextUrl.clone();
-      url.pathname = '/';
-      return NextResponse.redirect(url);
+      return redirect('/');
     }
 
     // The verification-code second factor is enforced in the Node runtime —
@@ -95,10 +117,7 @@ export async function middleware(request: NextRequest) {
       if (isAdminApi) {
         return NextResponse.json({ error: 'Admin verification required' }, { status: 403 });
       }
-      const url = request.nextUrl.clone();
-      url.pathname = '/auth/verify';
-      url.searchParams.set('redirect', path);
-      return NextResponse.redirect(url);
+      return redirect('/auth/verify', { redirect: path });
     }
   }
 
@@ -109,8 +128,9 @@ export const config = {
   // Run on all routes except Next.js internals, static assets and the metadata
   // routes. /api/stream authenticates itself and is hit repeatedly during
   // playback, so it is excluded too — running the session refresh on every
-  // audio request added a Supabase round-trip to each one.
+  // audio request added a Supabase round-trip to each one. /api/health is
+  // polled by the deploy script and needs no session.
   matcher: [
-    '/((?!_next/static|_next/image|api/stream|favicon.ico|robots.txt|sitemap.xml|manifest.webmanifest|icon|apple-icon|opengraph-image|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|mp3|woff2?)$).*)',
+    '/((?!_next/static|_next/image|api/stream|api/health|favicon.ico|robots.txt|sitemap.xml|manifest.webmanifest|icon|apple-icon|opengraph-image|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico|mp3|woff2?)$).*)',
   ],
 };

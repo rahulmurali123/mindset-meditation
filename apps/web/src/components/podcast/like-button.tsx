@@ -4,6 +4,7 @@ import { useState, useTransition } from 'react';
 import { Heart } from 'lucide-react';
 import { toast } from 'sonner';
 import { toggleSave } from '@/app/actions';
+import { runAction } from '@/lib/run-action';
 import { cn } from '@/lib/utils';
 
 export function LikeButton({
@@ -24,7 +25,7 @@ export function LikeButton({
       const prev = saved;
       setSaved(!prev);
       setCount((c) => c + (prev ? -1 : 1));
-      const res = await toggleSave(trackId);
+      const res = await runAction(() => toggleSave(trackId));
       if ('error' in res && res.error) {
         setSaved(prev);
         setCount((c) => c + (prev ? 1 : -1));

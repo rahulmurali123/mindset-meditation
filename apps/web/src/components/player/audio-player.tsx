@@ -11,6 +11,7 @@ import { toast } from 'sonner';
 import { usePlayerStore } from '@/store/player.store';
 import { useAudioPlayer } from '@/components/providers/audio-player-provider';
 import { toggleSave, isSaved } from '@/app/actions';
+import { runAction } from '@/lib/run-action';
 import { cn } from '@/lib/utils';
 import { BRAND } from '@/lib/brand';
 
@@ -40,9 +41,12 @@ export function AudioPlayer() {
   useEffect(() => {
     if (!playingId) return;
     let cancelled = false;
-    isSaved(playingId).then((saved) => {
-      if (!cancelled) setLikedId(saved ? playingId : null);
-    });
+    isSaved(playingId)
+      .then((saved) => {
+        if (!cancelled) setLikedId(saved ? playingId : null);
+      })
+      // Cosmetic: an unreachable server just leaves the heart empty.
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -73,7 +77,7 @@ export function AudioPlayer() {
     if (!id) return;
     // Optimistic flip; revert on error.
     setLikedId((prev) => (prev === id ? null : id));
-    const res = await toggleSave(id);
+    const res = await runAction(() => toggleSave(id));
     if ('error' in res && res.error) {
       setLikedId((prev) => (prev === id ? null : id));
       toast.error(res.error === 'Please sign in' ? 'Sign in to save episodes' : res.error);

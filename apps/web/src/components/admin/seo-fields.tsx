@@ -1,7 +1,7 @@
 'use client';
 
 import { BRAND } from '@/lib/brand';
-import { slugify } from '@/lib/podcast';
+import { TRACK_LIMITS, slugify } from '@/lib/podcast';
 import { SITE_URL } from '@/lib/seo';
 import { buildExcerpt, buildKeywords, buildMetaDescription } from '@/lib/seo/generate';
 import { cn } from '@/lib/utils';
@@ -116,6 +116,7 @@ export function SeoFields({
           rows={2}
           className={INPUT}
           value={overrides.metaDescription}
+          maxLength={TRACK_LIMITS.metaDescription}
           placeholder={generated.metaDescription}
           onChange={(e) => onChange({ ...overrides, metaDescription: e.target.value })}
         />

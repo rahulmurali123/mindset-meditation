@@ -11,6 +11,7 @@ import {
 } from '@/components/auth/auth-shell';
 import { BRAND } from '@/lib/brand';
 import { signUpAction } from '@/app/auth/actions';
+import { runAction } from '@/lib/run-action';
 import { toast } from 'sonner';
 
 export default function RegisterPage() {
@@ -25,7 +26,7 @@ export default function RegisterPage() {
     setError(null);
     setLoading(true);
 
-    const res = await signUpAction({ username, email, password });
+    const res = await runAction(() => signUpAction({ username, email, password }));
 
     if (res.error) {
       setError({ message: res.error, field: res.field });

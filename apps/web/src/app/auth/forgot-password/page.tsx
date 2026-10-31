@@ -16,6 +16,7 @@ import {
   AuthError,
 } from '@/components/auth/auth-shell';
 import { requestPasswordResetAction } from '@/app/auth/actions';
+import { runAction } from '@/lib/run-action';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -37,7 +38,7 @@ export default function ForgotPasswordPage() {
     setFieldError(null);
     setLoading(true);
 
-    const res = await requestPasswordResetAction({ email });
+    const res = await runAction(() => requestPasswordResetAction({ email }));
     setLoading(false);
 
     // A delivery failure is a server misconfiguration rather than a fact about

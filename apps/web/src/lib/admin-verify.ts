@@ -24,7 +24,11 @@ export function verificationCode(): string | null {
   return code && code.length > 0 ? code : null;
 }
 
-/** Signing key. Server-only and always present, so no extra env var is needed. */
+/**
+ * Signing key. Server-only and always present, so no extra env var is needed.
+ * Rotating SUPABASE_SERVICE_ROLE_KEY therefore invalidates every admin
+ * verification: admins are asked for the code again, nothing else breaks.
+ */
 async function hmacKey(): Promise<CryptoKey> {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!key) throw new Error('SUPABASE_SERVICE_ROLE_KEY is required to sign admin sessions');

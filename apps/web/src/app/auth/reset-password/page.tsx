@@ -20,6 +20,7 @@ import Link from 'next/link';
 import { Lock, Loader2, CheckCircle2, TriangleAlert } from 'lucide-react';
 import { AuthShell, AuthField, AuthSubmit, AuthError } from '@/components/auth/auth-shell';
 import { createClient } from '@/lib/supabase/client';
+import { ACTION_FAILED } from '@/lib/run-action';
 import { toast } from 'sonner';
 
 type Phase = 'verifying' | 'ready' | 'expired' | 'invalid' | 'done';
@@ -110,8 +111,14 @@ function ResetPasswordForm() {
     if (!validate()) return;
 
     setLoading(true);
-    const { error: updateError } = await createClient().auth.updateUser({ password });
-    setLoading(false);
+    let updateError: { message: string } | null;
+    try {
+      ({ error: updateError } = await createClient().auth.updateUser({ password }));
+    } catch {
+      updateError = { message: ACTION_FAILED };
+    } finally {
+      setLoading(false);
+    }
 
     if (updateError) {
       // A recovery session is short-lived; if it lapsed mid-form, say so

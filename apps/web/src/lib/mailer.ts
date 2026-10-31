@@ -52,6 +52,12 @@ function smtpOptions() {
     // that hangs and then times out.
     secure: process.env.SMTP_SECURE ? process.env.SMTP_SECURE === 'true' : port === 465,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    // Nodemailer's defaults wait minutes on a wrong port. nginx gives up at
+    // 60 s, so the form saw a 504 instead of explainSmtpError's actual reason.
+    // Connection and greeting match scripts/test-smtp.mjs.
+    connectionTimeout: 15_000,
+    greetingTimeout: 15_000,
+    socketTimeout: 20_000,
   };
 }
 

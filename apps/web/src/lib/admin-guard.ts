@@ -14,8 +14,9 @@ import { cache } from 'react';
 import { cookies } from 'next/headers';
 import { createClient } from '@/lib/supabase/server';
 import { ADMIN_COOKIE, adminIsVerified } from '@/lib/admin-verify';
+import { logSupabaseError } from '@/lib/supabase/errors';
 
-export type AdminDenial = 'unauthenticated' | 'forbidden' | 'unverified';
+export type AdminDenial = 'unauthenticated' | 'forbidden' | 'unverified' | 'unavailable';
 
 export interface AdminCheck {
   ok: boolean;
@@ -30,7 +31,14 @@ export const checkAdmin = cache(async (): Promise<AdminCheck> => {
   } = await supabase.auth.getUser();
   if (!user) return { ok: false, reason: 'unauthenticated' };
 
-  const { data: role } = await supabase.rpc('get_user_role', { p_user_id: user.id });
+  const { data: role, error: roleError } = await supabase.rpc('get_user_role', {
+    p_user_id: user.id,
+  });
+  // An outage, not a verdict — see middleware.ts.
+  if (roleError) {
+    logSupabaseError('admin-guard', roleError);
+    return { ok: false, userId: user.id, reason: 'unavailable' };
+  }
   if (role !== 'admin' && role !== 'super_admin') {
     return { ok: false, userId: user.id, reason: 'forbidden' };
   }
@@ -50,4 +58,5 @@ export const ADMIN_DENIAL_RESPONSE: Record<AdminDenial, { status: number; error:
   unauthenticated: { status: 401, error: 'Unauthorized' },
   forbidden: { status: 403, error: 'Forbidden' },
   unverified: { status: 403, error: 'Admin verification required' },
+  unavailable: { status: 503, error: 'Service unavailable' },
 };

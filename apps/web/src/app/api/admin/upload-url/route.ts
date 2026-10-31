@@ -1,5 +1,6 @@
 import { ADMIN_DENIAL_RESPONSE, checkAdmin } from '@/lib/admin-guard';
 import { AUDIO_BUCKET, audioBackend, encodeAudioPath } from '@/lib/audio-storage';
+import { MAX_AUDIO_BYTES } from '@/lib/podcast';
 import {
   MULTIPART_THRESHOLD,
   PART_SIZE,
@@ -27,6 +28,23 @@ function newKey(filename: unknown): string {
       .replace(/[^a-z0-9]/g, '') || 'mp3';
   return `podcasts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
 }
+
+/**
+ * MIME types the private podcast-audio Supabase bucket accepts — its
+ * allowed_mime_types in fullschema.sql. R2 takes anything, so this only gates
+ * the Supabase fallback, where an .m4a or .wav used to transfer in full and
+ * then fail with "mime type … is not supported".
+ */
+const SUPABASE_AUDIO_TYPES = new Set([
+  'audio/mpeg',
+  'audio/mp3',
+  'audio/ogg',
+  'audio/wav',
+  'audio/aac',
+  'audio/flac',
+]);
+
+const AUDIO_CONTAINER_TYPES = new Set(['video/webm', 'video/mp4']);
 
 function fail(message: string, status = 500) {
   return NextResponse.json({ error: message }, { status });
@@ -85,7 +103,26 @@ export async function POST(req: NextRequest) {
   const contentType: string = body.contentType || 'audio/mpeg';
   const size = Number(body.size) || 0;
 
+  // Refused before a single byte moves, rather than after the whole transfer.
+  if (size > MAX_AUDIO_BYTES) {
+    return fail(
+      `That file is ${Math.round(size / 1024 / 1024)} MB — the limit is ${MAX_AUDIO_BYTES / 1024 / 1024} MB.`,
+      413,
+    );
+  }
+  // Browsers label recorder output (.webm, .mp4) as video/*, though it is the
+  // audio track that plays. R2 stores either; Supabase is narrowed below.
+  if (!contentType.startsWith('audio/') && !AUDIO_CONTAINER_TYPES.has(contentType)) {
+    return fail('That file is not audio.', 415);
+  }
+
   if (backend !== 'r2') {
+    if (!SUPABASE_AUDIO_TYPES.has(contentType)) {
+      return fail(
+        `This server stores audio in Supabase Storage, which accepts MP3, OGG, WAV, AAC and FLAC — not ${contentType}. Export the episode as MP3, or configure Cloudflare R2.`,
+        415,
+      );
+    }
     return NextResponse.json({
       backend,
       mode: 'single',

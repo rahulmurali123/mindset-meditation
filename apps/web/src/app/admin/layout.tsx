@@ -19,6 +19,18 @@ export default async function AdminLayout({ children }: { children: ReactNode })
   if (!admin.ok) {
     if (admin.reason === 'unauthenticated') redirect('/auth/login?redirect=/admin');
     if (admin.reason === 'forbidden') redirect('/');
+    if (admin.reason === 'unavailable') {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-6 text-center">
+          <div className="max-w-md space-y-3">
+            <h1 className="text-2xl font-black text-foreground">Admin is temporarily unavailable</h1>
+            <p className="text-sm text-muted-foreground">
+              The database could not be reached. Please try again in a moment.
+            </p>
+          </div>
+        </div>
+      );
+    }
     redirect('/auth/verify?redirect=/admin');
   }
 

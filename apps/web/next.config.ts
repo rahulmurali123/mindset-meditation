@@ -3,25 +3,36 @@ import path from 'node:path';
 import type { NextConfig } from 'next';
 
 /**
- * All environment config lives in a single .env at the repo root, outside
- * apps/. Next only auto-loads env files sitting next to next.config, so load
- * the root one here.
+ * All environment config lives at the repo root, outside apps/. Next only
+ * auto-loads env files sitting next to next.config, so load the root ones here.
  *
  * This runs before the build, so NEXT_PUBLIC_* values are still inlined into
  * the client bundle correctly. Real environment variables take precedence, so
  * a production host (systemd EnvironmentFile, Docker -e, panel UI) can inject
  * secrets without any file on disk.
+ *
+ * Precedence, highest first: real environment, .env.local, .env.production
+ * (production builds only — the same file DEPLOY.md's systemd unit reads, so
+ * the build and the running server cannot disagree), then .env.
  */
 function loadRootEnv() {
   const root = path.join(__dirname, '..', '..');
-  // Keys this loader has set, so a real environment variable still wins but a
-  // later line in the file can correct an earlier one.
-  const fromFile = new Set<string>();
+  const files = [
+    '.env.local',
+    ...(process.env.NODE_ENV === 'production' ? ['.env.production'] : []),
+    '.env',
+  ];
+  // Keys a higher-precedence file has already provided. These used to share
+  // one set with the current file, so a later, LOWER-precedence file
+  // overwrote them: a key in both .env.local and .env took .env's value.
+  const fromEarlierFile = new Set<string>();
 
-  // .env.local wins over .env, matching Next's own precedence.
-  for (const name of ['.env.local', '.env']) {
+  for (const name of files) {
     const file = path.join(root, name);
     if (!fs.existsSync(file)) continue;
+    // Keys this file has set, so a later line in the same file can correct an
+    // earlier one.
+    const fromThisFile = new Set<string>();
     const seen = new Set<string>();
 
     for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
@@ -47,16 +58,20 @@ function loadRootEnv() {
       }
       seen.add(key);
 
+      // A blank value provides nothing: it must not erase a value already
+      // found, nor stop a lower-precedence file supplying the real one.
+      if (value === '') continue;
+      // A higher-precedence file already supplied it.
+      if (fromEarlierFile.has(key)) continue;
       // A real environment variable (systemd, Docker -e, hosting panel) always
       // wins over the file.
-      const setByEnvironment = process.env[key] !== undefined && !fromFile.has(key);
-      if (setByEnvironment) continue;
-      // Never let a blank line erase a value already found.
-      if (value === '' && process.env[key]) continue;
+      if (process.env[key] !== undefined && !fromThisFile.has(key)) continue;
 
       process.env[key] = value;
-      fromFile.add(key);
+      fromThisFile.add(key);
     }
+
+    for (const key of fromThisFile) fromEarlierFile.add(key);
   }
 }
 

@@ -39,3 +39,7 @@ COMMENT ON COLUMN podcast.play_events.track_id IS
 -- comments / favorites / playlist_tracks keep ON DELETE CASCADE: those rows are
 -- *about* the episode and mean nothing without it, unlike a play event, which
 -- is a fact about site traffic.
+
+INSERT INTO podcast.schema_migrations (version)
+VALUES ('036_hard_delete_tracks_keep_play_history')
+ON CONFLICT DO NOTHING;

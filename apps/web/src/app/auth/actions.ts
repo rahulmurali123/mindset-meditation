@@ -10,6 +10,7 @@ import { ADMIN_COOKIE, codeMatches, issueToken, verificationCode } from '@/lib/a
 import { SESSION_ONLY_COOKIE } from '@/lib/supabase/cookie-options';
 import { sendMail, smtpConfigured, passwordResetEmail, explainSmtpError } from '@/lib/mailer';
 import { SITE_URL } from '@/lib/seo';
+import { SERVICE_UNAVAILABLE, logSupabaseError } from '@/lib/supabase/errors';
 
 const USERNAME_RE = /^[a-z0-9_]{3,20}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -71,10 +72,17 @@ export async function signUpAction(input: {
   // eq, not ilike: "_" and "%" are LIKE wildcards, and usernames may contain
   // underscores — "sub_ash" would otherwise collide with "subhash". Both
   // columns are stored lowercased, so exact match is already case-insensitive.
-  const [{ data: byUsername }, { data: byEmail }] = await Promise.all([
+  const [usernameLookup, emailLookup] = await Promise.all([
     admin.from('profiles').select('id').eq('username', username).maybeSingle(),
     admin.from('profiles').select('id').eq('email', email).maybeSingle(),
   ]);
+  const lookupError = usernameLookup.error ?? emailLookup.error;
+  if (lookupError) {
+    logSupabaseError('auth/signup', lookupError);
+    return { error: SERVICE_UNAVAILABLE };
+  }
+  const byUsername = usernameLookup.data;
+  const byEmail = emailLookup.data;
 
   if (byUsername) {
     return { error: 'That username is already taken. Try another one.', field: 'username' };
@@ -109,6 +117,7 @@ export async function signUpAction(input: {
         field: 'email',
       };
     }
+    logSupabaseError('auth/signup', createError);
     return { error: createError.message };
   }
 
@@ -152,11 +161,18 @@ export async function signInAction(input: {
   // Not an email? Then it's a username — look up the address it belongs to.
   if (!identifier.includes('@')) {
     const admin = createAdminClient();
-    const { data: profile } = await admin
+    const { data: profile, error: lookupError } = await admin
       .from('profiles')
       .select('email')
       .eq('username', identifier.toLowerCase())
       .maybeSingle();
+
+    // A failed lookup is not "no such user" — reporting it as a wrong password
+    // sends people hunting for a typo during an outage.
+    if (lookupError) {
+      logSupabaseError('auth/signin', lookupError);
+      return { error: SERVICE_UNAVAILABLE };
+    }
 
     // Deliberately the same message as a bad password, so this can't be used to
     // discover which usernames exist.
@@ -196,13 +212,25 @@ export async function signInAction(input: {
     if (message.includes('invalid login credentials')) {
       return { error: 'Incorrect username/email or password.', field: 'password' };
     }
+    logSupabaseError('auth/signin', error);
     return { error: error.message };
   }
 
   // Admins owe a second factor. The password alone must not reach /admin.
   const userId = data.user?.id;
   if (userId) {
-    const { data: role } = await supabase.rpc('get_user_role', { p_user_id: userId });
+    const { data: role, error: roleError } = await supabase.rpc('get_user_role', {
+      p_user_id: userId,
+    });
+    // Without the role we can't tell an admin from a listener. Signing the
+    // admin in as a listener is what made /admin look permanently locked.
+    if (roleError) {
+      logSupabaseError('auth/signin', roleError);
+      // Local: a transient lookup failure must not end this admin's sessions
+      // on every other device.
+      await supabase.auth.signOut({ scope: 'local' });
+      return { error: SERVICE_UNAVAILABLE };
+    }
     if (role === 'admin' || role === 'super_admin') {
       return { ok: true, needsAdminCode: true };
     }
@@ -223,7 +251,13 @@ export async function verifyAdminCodeAction(input: { code: string }): Promise<Au
   } = await supabase.auth.getUser();
   if (!user) return { error: 'Session expired — sign in again.', field: 'code' };
 
-  const { data: role } = await supabase.rpc('get_user_role', { p_user_id: user.id });
+  const { data: role, error: roleError } = await supabase.rpc('get_user_role', {
+    p_user_id: user.id,
+  });
+  if (roleError) {
+    logSupabaseError('auth/verify', roleError);
+    return { error: SERVICE_UNAVAILABLE, field: 'code' };
+  }
   if (role !== 'admin' && role !== 'super_admin') {
     return { error: 'This account is not an administrator.', field: 'code' };
   }
@@ -313,7 +347,14 @@ export async function requestPasswordResetAction(input: {
 
   // No such account. Reported as success on purpose: a distinct response here
   // would turn this form into a way to test which addresses are registered.
-  if (error || !data?.properties?.hashed_token) return { ok: true };
+  // Any other failure is still logged, so a misconfigured server is visible to
+  // whoever reads the logs rather than looking like a delivered email.
+  if (error || !data?.properties?.hashed_token) {
+    if (error && !/not found|no user/i.test(error.message)) {
+      logSupabaseError('auth/reset', error);
+    }
+    return { ok: true };
+  }
 
   const link = `${SITE_URL}/auth/reset-password?token_hash=${encodeURIComponent(
     data.properties.hashed_token,

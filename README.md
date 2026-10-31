@@ -51,7 +51,7 @@ even if a request bypasses the app.
 
 ## Quick start
 
-**Requirements:** Node 20+, pnpm 9+, a Supabase project.
+**Requirements:** Node 22+, pnpm 9+, a Supabase project.
 
 ```bash
 git clone https://github.com/<owner>/mindset-meditation.git
@@ -65,7 +65,11 @@ of [`fullschema.sql`](./fullschema.sql), and run it. That single file creates th
 schema, tables, indexes, functions, triggers, RLS policies, storage buckets and
 the seed categories.
 
-Then confirm **Settings → API → Exposed schemas** includes `podcast`.
+Then open **Project Settings → Data API → Exposed schemas**, add `podcast` and
+**Save** — even if it is already listed. The SQL file exposes it only until
+Supabase next reloads its API config; the dashboard setting is the one that
+lasts (see DEPLOY.md §4). `/api/health` reports `"schema": false` while it is
+missing.
 
 **Create an admin.** Credentials are passed in, never stored on disk:
 

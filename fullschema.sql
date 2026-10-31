@@ -90,7 +90,9 @@ CREATE TABLE IF NOT EXISTS podcast.favorites (
 
 CREATE TABLE IF NOT EXISTS podcast.play_events (
     id UUID DEFAULT gen_random_uuid() NOT NULL,
-    track_id UUID NOT NULL,
+    -- NULL once the episode is deleted (036): the play still counts toward
+    -- all-time totals, it just no longer names an episode.
+    track_id UUID,
     user_id UUID,
     session_id TEXT NOT NULL,
     listened_seconds INTEGER DEFAULT 0 NOT NULL,
@@ -378,7 +380,10 @@ ALTER TABLE podcast.comments ADD CONSTRAINT comments_user_id_fkey FOREIGN KEY (u
 ALTER TABLE podcast.comments ADD CONSTRAINT comments_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES podcast.comments(id) ON DELETE CASCADE;
 ALTER TABLE podcast.favorites ADD CONSTRAINT favorites_user_id_fkey FOREIGN KEY (user_id) REFERENCES podcast.profiles(id) ON DELETE CASCADE;
 ALTER TABLE podcast.favorites ADD CONSTRAINT favorites_track_id_fkey FOREIGN KEY (track_id) REFERENCES podcast.tracks(id) ON DELETE CASCADE;
-ALTER TABLE podcast.play_events ADD CONSTRAINT play_events_track_id_fkey FOREIGN KEY (track_id) REFERENCES podcast.tracks(id) ON DELETE CASCADE;
+-- SET NULL, not CASCADE (036): deleting an episode must not erase its plays
+-- from the analytics totals. DROP NOT NULL converges databases built earlier.
+ALTER TABLE podcast.play_events ALTER COLUMN track_id DROP NOT NULL;
+ALTER TABLE podcast.play_events ADD CONSTRAINT play_events_track_id_fkey FOREIGN KEY (track_id) REFERENCES podcast.tracks(id) ON DELETE SET NULL;
 ALTER TABLE podcast.play_events ADD CONSTRAINT play_events_user_id_fkey FOREIGN KEY (user_id) REFERENCES podcast.profiles(id) ON DELETE SET NULL;
 ALTER TABLE podcast.playlist_tracks ADD CONSTRAINT playlist_tracks_track_id_fkey FOREIGN KEY (track_id) REFERENCES podcast.tracks(id) ON DELETE CASCADE;
 ALTER TABLE podcast.playlist_tracks ADD CONSTRAINT playlist_tracks_playlist_id_fkey FOREIGN KEY (playlist_id) REFERENCES podcast.playlists(id) ON DELETE CASCADE;
@@ -1511,9 +1516,9 @@ BEGIN
   END IF;
 
   EXECUTE format('ALTER ROLE authenticator SET pgrst.db_schemas = %L', newval);
-  RAISE NOTICE 'PostgREST exposed schemas: %', newval;
+  RAISE NOTICE 'PostgREST exposed schemas: % (temporary: also add "podcast" under Dashboard -> Project Settings -> Data API -> Exposed schemas, or a config reload will drop it)', newval;
 EXCEPTION WHEN OTHERS THEN
-  RAISE NOTICE 'Could not set exposed schemas automatically (%). Add "podcast" under Dashboard -> Settings -> API -> Exposed schemas.', SQLERRM;
+  RAISE NOTICE 'Could not set exposed schemas automatically (%). Add "podcast" under Dashboard -> Project Settings -> Data API -> Exposed schemas.', SQLERRM;
 END $$;
 
 NOTIFY pgrst, 'reload config';
@@ -1597,14 +1602,21 @@ INSERT INTO podcast.schema_migrations (version) VALUES
     ('032_verify_playlist_delete_policy'),
     ('033_playlist_delete_via_rpc'),
     ('034_security_audit_hardening'),
-    ('035_analytics_reach_and_dashboard')
+    ('035_analytics_reach_and_dashboard'),
+    ('036_hard_delete_tracks_keep_play_history')
 ON CONFLICT DO NOTHING;
 
 -- =============================================================================
 -- AFTER RUNNING THIS FILE
 -- =============================================================================
--- 1. Check Dashboard -> Settings -> API -> Exposed schemas lists "podcast".
---    The DO block sets it automatically, but some projects restrict ALTER ROLE.
+-- 1. Dashboard -> Project Settings -> Data API -> Exposed schemas: make sure
+--    "podcast" is listed, and SAVE it there even if it already appears.
+--    The DO block's ALTER ROLE takes effect immediately, but on hosted
+--    Supabase the dashboard value is the durable one: the next time the API
+--    config is reloaded (project pause/resume, a platform restart, any save
+--    on that settings page) it replaces whatever ALTER ROLE set. When that
+--    happened in production, every sign-in and upload broke at once.
+--    GET /api/health reports "schema": false while it is missing.
 -- 2. Create the first admin (credentials are never stored in .env):
 --      pnpm seed:admin -- --email you@example.com --password '...'
 -- 3. Set ADMIN_VERIFICATION_CODE in .env — admin sign-in requires it.
