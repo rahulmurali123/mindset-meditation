@@ -39,7 +39,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
     return new NextResponse('Not found', { status: 404 });
   }
 
-  const url = await signAudioUrl(track.audio_path, 3600);
+  const url = await signAudioUrl(track.audio_path, 6 * 60 * 60);
   if (!url) return new NextResponse('Audio unavailable', { status: 503 });
 
   // 302, not 301: the target is a short-lived signed URL and must never be

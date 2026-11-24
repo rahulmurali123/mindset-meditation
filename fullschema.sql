@@ -165,6 +165,17 @@ CREATE TABLE IF NOT EXISTS podcast.profiles (
     role TEXT DEFAULT 'user'::text NOT NULL
 );
 
+-- Admin sessions that have passed the verification-code second factor, keyed
+-- by the Supabase JWT's session_id. is_admin() requires a live row here, so a
+-- password-only session has no admin rights in the database (migration 038).
+CREATE TABLE IF NOT EXISTS podcast.admin_sessions (
+    session_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    verified_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS admin_sessions_user_idx ON podcast.admin_sessions (user_id);
+
 CREATE TABLE IF NOT EXISTS podcast.schema_migrations (
     version TEXT NOT NULL,
     applied_at TIMESTAMPTZ DEFAULT now() NOT NULL
@@ -354,6 +365,13 @@ ALTER TABLE podcast.playlists DROP CONSTRAINT IF EXISTS playlists_title_check;
 ALTER TABLE podcast.playlists ADD CONSTRAINT playlists_title_check CHECK ((length(title) <= 200));
 ALTER TABLE podcast.profiles DROP CONSTRAINT IF EXISTS profiles_role_check;
 ALTER TABLE podcast.profiles ADD CONSTRAINT profiles_role_check CHECK ((role = ANY (ARRAY['user'::text, 'moderator'::text, 'admin'::text, 'super_admin'::text])));
+-- Users can edit these two columns through PostgREST, so the sign-up form's
+-- rules have to hold in the database too (migration 037). NOT VALID: new
+-- writes are checked, rows from before 037 are not.
+ALTER TABLE podcast.profiles DROP CONSTRAINT IF EXISTS profiles_username_format_check;
+ALTER TABLE podcast.profiles ADD CONSTRAINT profiles_username_format_check CHECK (username IS NULL OR username ~ '^[a-z0-9_]{3,20}$') NOT VALID;
+ALTER TABLE podcast.profiles DROP CONSTRAINT IF EXISTS profiles_full_name_length_check;
+ALTER TABLE podcast.profiles ADD CONSTRAINT profiles_full_name_length_check CHECK (full_name IS NULL OR length(full_name) <= 100) NOT VALID;
 ALTER TABLE podcast.tracks DROP CONSTRAINT IF EXISTS tracks_status_check;
 ALTER TABLE podcast.tracks ADD CONSTRAINT tracks_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'published'::text, 'archived'::text])));
 ALTER TABLE podcast.tracks DROP CONSTRAINT IF EXISTS tracks_title_check;
@@ -398,6 +416,8 @@ CREATE INDEX IF NOT EXISTS comments_parent_idx ON podcast.comments USING btree (
 CREATE INDEX IF NOT EXISTS comments_track_parent_idx ON podcast.comments USING btree (track_id, parent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_comments_track_id ON podcast.comments USING btree (track_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_comments_user_id ON podcast.comments USING btree (user_id);
+-- Backs the per-user comment throttle (039).
+CREATE INDEX IF NOT EXISTS comments_user_created_idx ON podcast.comments USING btree (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_favorites_track_id ON podcast.favorites USING btree (track_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_user_id ON podcast.favorites USING btree (user_id);
 CREATE INDEX IF NOT EXISTS play_events_created_idx ON podcast.play_events USING btree (created_at DESC);
@@ -431,6 +451,30 @@ CREATE INDEX IF NOT EXISTS idx_tracks_status ON podcast.tracks USING btree (stat
 -- =============================================================================
 -- FUNCTIONS
 -- =============================================================================
+
+-- The comment rate limit (5 a minute, 100 a day), enforced where a direct
+-- PostgREST insert cannot skip it (039). Service role and admins are exempt.
+CREATE OR REPLACE FUNCTION podcast.throttle_comments()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, podcast
+AS $$
+BEGIN
+    IF auth.uid() IS NULL OR podcast.is_admin() THEN
+        RETURN NEW;
+    END IF;
+
+    IF (SELECT count(*) FROM podcast.comments
+         WHERE user_id = NEW.user_id AND created_at > now() - interval '1 minute') >= 5
+       OR (SELECT count(*) FROM podcast.comments
+         WHERE user_id = NEW.user_id AND created_at > now() - interval '1 day') >= 100
+    THEN
+        RAISE EXCEPTION 'comment_rate_limited' USING ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION podcast.check_comment_parent()
  RETURNS trigger
@@ -981,19 +1025,35 @@ END;
 $function$
 ;
 
+CREATE OR REPLACE FUNCTION podcast.admin_session_verified()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path = pg_catalog, podcast
+AS $function$
+    SELECT EXISTS (
+        SELECT 1 FROM podcast.admin_sessions s
+        WHERE s.user_id = auth.uid()
+          AND s.session_id::text = COALESCE(auth.jwt() ->> 'session_id', '')
+          AND s.expires_at > now()
+    );
+$function$;
+
+-- Role AND a session that passed the verification code (migration 038).
 CREATE OR REPLACE FUNCTION podcast.is_admin()
  RETURNS boolean
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
+ SET search_path = pg_catalog, podcast
 AS $function$
 BEGIN
     RETURN EXISTS (
         SELECT 1 FROM podcast.profiles
         WHERE id = auth.uid() AND role IN ('admin', 'super_admin')
-    );
+    ) AND podcast.admin_session_verified();
 END;
-$function$
-;
+$function$;
+
 
 -- is_premium_user() removed: it referenced objects this schema never creates
 -- and nothing in the app called it.
@@ -1003,22 +1063,16 @@ CREATE OR REPLACE FUNCTION podcast.is_super_admin()
  RETURNS boolean
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
+ SET search_path = pg_catalog, podcast
 AS $function$
 BEGIN
-    -- Reads profiles.role, the same column is_admin() uses. This previously
-    -- joined podcast.user_roles + podcast.roles, which migration 021 collapsed
-    -- into that column and this schema never creates — so every call raised,
-    -- and because profiles_delete_admin USES this function, deleting a profile
-    -- always errored.
     RETURN EXISTS (
-        SELECT 1
-        FROM podcast.profiles p
-        WHERE p.id = auth.uid()
-          AND p.role = 'super_admin'
-    );
+        SELECT 1 FROM podcast.profiles p
+        WHERE p.id = auth.uid() AND p.role = 'super_admin'
+    ) AND podcast.admin_session_verified();
 END;
-$function$
-;
+$function$;
+
 
 -- refresh_popular_tracks() removed: it referenced objects this schema never creates
 -- and nothing in the app called it.
@@ -1056,33 +1110,63 @@ END;
 $function$
 ;
 
+-- Playlist figures count PUBLISHED episodes only and are recomputed on every
+-- membership change and every status/duration change to a track (038).
+CREATE OR REPLACE FUNCTION podcast.refresh_playlist_stats(p_playlist_id uuid)
+ RETURNS void
+ LANGUAGE sql
+ SECURITY DEFINER
+ SET search_path = pg_catalog, podcast
+AS $function$
+    UPDATE podcast.playlists p
+    SET track_count = s.n,
+        total_duration_seconds = s.secs
+    FROM (
+        SELECT COUNT(t.id)::int AS n, COALESCE(SUM(t.duration_seconds), 0)::bigint AS secs
+        FROM podcast.playlist_tracks pt
+        JOIN podcast.tracks t ON t.id = pt.track_id
+        WHERE pt.playlist_id = p_playlist_id
+          AND t.status = 'published'
+          AND t.deleted_at IS NULL
+    ) s
+    WHERE p.id = p_playlist_id
+      AND (p.track_count IS DISTINCT FROM s.n OR p.total_duration_seconds IS DISTINCT FROM s.secs);
+$function$;
 CREATE OR REPLACE FUNCTION podcast.update_playlist_stats()
  RETURNS trigger
  LANGUAGE plpgsql
  SECURITY DEFINER
+ SET search_path = pg_catalog, podcast
 AS $function$
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        UPDATE podcast.playlists
-        SET
-            track_count = track_count + 1,
-            total_duration_seconds = total_duration_seconds + COALESCE(
-                (SELECT duration_seconds FROM podcast.tracks WHERE id = NEW.track_id), 0
-            )
-        WHERE id = NEW.playlist_id;
-    ELSIF TG_OP = 'DELETE' THEN
-        UPDATE podcast.playlists
-        SET
-            track_count = GREATEST(0, track_count - 1),
-            total_duration_seconds = GREATEST(0, total_duration_seconds - COALESCE(
-                (SELECT duration_seconds FROM podcast.tracks WHERE id = OLD.track_id), 0
-            ))
-        WHERE id = OLD.playlist_id;
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        PERFORM podcast.refresh_playlist_stats(NEW.playlist_id);
+    END IF;
+    IF TG_OP IN ('DELETE', 'UPDATE') THEN
+        PERFORM podcast.refresh_playlist_stats(OLD.playlist_id);
     END IF;
     RETURN NULL;
 END;
-$function$
-;
+$function$;
+
+CREATE OR REPLACE FUNCTION podcast.track_playlist_stats()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path = pg_catalog, podcast
+AS $function$
+DECLARE
+    v_playlist uuid;
+BEGIN
+    FOR v_playlist IN
+        SELECT playlist_id FROM podcast.playlist_tracks WHERE track_id = NEW.id
+    LOOP
+        PERFORM podcast.refresh_playlist_stats(v_playlist);
+    END LOOP;
+    RETURN NULL;
+END;
+$function$;
+
 
 -- Soft-deletes a playlist bypassing table RLS on purpose.
 --
@@ -1101,11 +1185,13 @@ CREATE OR REPLACE FUNCTION podcast.delete_playlist(p_id uuid)
  SET search_path = pg_catalog, podcast
 AS $function$
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM podcast.playlists
-        WHERE id = p_id AND (user_id = auth.uid() OR podcast.is_admin())
-    ) THEN
+    -- Admin-only since 037: listeners have no playlist feature, and owner
+    -- access was what let a free account manage public playlists.
+    IF NOT podcast.is_admin() THEN
         RAISE EXCEPTION 'Not authorized to delete this playlist' USING ERRCODE = '42501';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM podcast.playlists WHERE id = p_id) THEN
+        RAISE EXCEPTION 'Playlist not found' USING ERRCODE = 'P0002';
     END IF;
 
     UPDATE podcast.playlists SET deleted_at = now() WHERE id = p_id;
@@ -1150,6 +1236,8 @@ $function$
 -- =============================================================================
 DROP TRIGGER IF EXISTS trg_comment_count ON podcast.comments;
 CREATE TRIGGER trg_comment_count AFTER INSERT OR DELETE ON podcast.comments FOR EACH ROW EXECUTE FUNCTION podcast.update_comment_count();
+DROP TRIGGER IF EXISTS trg_throttle_comments ON podcast.comments;
+CREATE TRIGGER trg_throttle_comments BEFORE INSERT ON podcast.comments FOR EACH ROW EXECUTE FUNCTION podcast.throttle_comments();
 DROP TRIGGER IF EXISTS trg_comment_parent_check ON podcast.comments;
 CREATE TRIGGER trg_comment_parent_check BEFORE INSERT OR UPDATE ON podcast.comments FOR EACH ROW EXECUTE FUNCTION podcast.check_comment_parent();
 DROP TRIGGER IF EXISTS trg_comments_updated_at ON podcast.comments;
@@ -1159,7 +1247,9 @@ CREATE TRIGGER trg_favorite_count AFTER INSERT OR DELETE ON podcast.favorites FO
 DROP TRIGGER IF EXISTS trg_play_events_updated_at ON podcast.play_events;
 CREATE TRIGGER trg_play_events_updated_at BEFORE UPDATE ON podcast.play_events FOR EACH ROW EXECUTE FUNCTION podcast.handle_updated_at();
 DROP TRIGGER IF EXISTS trg_playlist_stats ON podcast.playlist_tracks;
-CREATE TRIGGER trg_playlist_stats AFTER INSERT OR DELETE ON podcast.playlist_tracks FOR EACH ROW EXECUTE FUNCTION podcast.update_playlist_stats();
+CREATE TRIGGER trg_playlist_stats AFTER INSERT OR UPDATE OR DELETE ON podcast.playlist_tracks FOR EACH ROW EXECUTE FUNCTION podcast.update_playlist_stats();
+DROP TRIGGER IF EXISTS trg_track_playlist_stats ON podcast.tracks;
+CREATE TRIGGER trg_track_playlist_stats AFTER UPDATE OF status, duration_seconds, deleted_at ON podcast.tracks FOR EACH ROW EXECUTE FUNCTION podcast.track_playlist_stats();
 DROP TRIGGER IF EXISTS trg_playlists_updated_at ON podcast.playlists;
 CREATE TRIGGER trg_playlists_updated_at BEFORE UPDATE ON podcast.playlists FOR EACH ROW EXECUTE FUNCTION podcast.handle_updated_at();
 DROP TRIGGER IF EXISTS trg_guard_profile_role ON podcast.profiles;
@@ -1180,6 +1270,7 @@ CREATE TRIGGER on_auth_user_created_podcast AFTER INSERT ON auth.users FOR EACH 
 -- =============================================================================
 -- ROW LEVEL SECURITY
 -- =============================================================================
+ALTER TABLE podcast.admin_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE podcast.comments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE podcast.favorites ENABLE ROW LEVEL SECURITY;
 ALTER TABLE podcast.play_events ENABLE ROW LEVEL SECURITY;
@@ -1246,18 +1337,16 @@ CREATE POLICY play_events_select_admin ON podcast.play_events
     FOR SELECT TO public
     USING (podcast.is_admin());
 
+-- Playlist writes are admin-only (migration 037). Listeners have no playlist
+-- feature, and the old owner-based policies let any free account publish a
+-- public playlist — which the homepage, /playlists and the sitemap all show.
 DROP POLICY IF EXISTS playlist_tracks_manage_own ON podcast.playlist_tracks;
-CREATE POLICY playlist_tracks_manage_own ON podcast.playlist_tracks
+DROP POLICY IF EXISTS playlist_tracks_manage_admin ON podcast.playlist_tracks;
+CREATE POLICY playlist_tracks_manage_admin ON podcast.playlist_tracks
     AS PERMISSIVE
     FOR ALL TO public
-    USING (((EXISTS ( SELECT 1
-   FROM podcast.playlists p
-  WHERE ((p.id = playlist_tracks.playlist_id) AND (p.user_id = auth.uid())))) OR podcast.is_admin()))
-    WITH CHECK ((podcast.is_admin() OR ((EXISTS ( SELECT 1
-   FROM podcast.playlists p
-  WHERE ((p.id = playlist_tracks.playlist_id) AND (p.user_id = auth.uid())))) AND (EXISTS ( SELECT 1
-   FROM podcast.tracks t
-  WHERE ((t.id = playlist_tracks.track_id) AND (t.status = 'published'::text) AND (t.deleted_at IS NULL)))))));
+    USING (podcast.is_admin())
+    WITH CHECK (podcast.is_admin());
 
 DROP POLICY IF EXISTS playlist_tracks_select ON podcast.playlist_tracks;
 CREATE POLICY playlist_tracks_select ON podcast.playlist_tracks
@@ -1268,16 +1357,18 @@ CREATE POLICY playlist_tracks_select ON podcast.playlist_tracks
   WHERE ((p.id = playlist_tracks.playlist_id) AND ((p.user_id = auth.uid()) OR (p.is_public = true))))) OR podcast.is_admin()));
 
 DROP POLICY IF EXISTS playlists_delete_own ON podcast.playlists;
-CREATE POLICY playlists_delete_own ON podcast.playlists
+DROP POLICY IF EXISTS playlists_delete_admin ON podcast.playlists;
+CREATE POLICY playlists_delete_admin ON podcast.playlists
     AS PERMISSIVE
     FOR DELETE TO public
-    USING (((user_id = auth.uid()) OR podcast.is_admin()));
+    USING (podcast.is_admin());
 
 DROP POLICY IF EXISTS playlists_insert_own ON podcast.playlists;
-CREATE POLICY playlists_insert_own ON podcast.playlists
+DROP POLICY IF EXISTS playlists_insert_admin ON podcast.playlists;
+CREATE POLICY playlists_insert_admin ON podcast.playlists
     AS PERMISSIVE
     FOR INSERT TO public
-    WITH CHECK ((user_id = auth.uid()));
+    WITH CHECK (((user_id = auth.uid()) AND podcast.is_admin()));
 
 DROP POLICY IF EXISTS playlists_select ON podcast.playlists;
 CREATE POLICY playlists_select ON podcast.playlists
@@ -1290,10 +1381,11 @@ CREATE POLICY playlists_select ON podcast.playlists
 -- which made soft-deleting a playlist violate the very policy meant to allow it
 -- ("new row violates row-level security policy"). See migration 031.
 DROP POLICY IF EXISTS playlists_update_own ON podcast.playlists;
-CREATE POLICY playlists_update_own ON podcast.playlists
+DROP POLICY IF EXISTS playlists_update_admin ON podcast.playlists;
+CREATE POLICY playlists_update_admin ON podcast.playlists
     AS PERMISSIVE
     FOR UPDATE TO public
-    USING (((user_id = auth.uid()) OR podcast.is_admin()));
+    USING (podcast.is_admin());
 
 DROP POLICY IF EXISTS profiles_delete_admin ON podcast.profiles;
 CREATE POLICY profiles_delete_admin ON podcast.profiles
@@ -1375,8 +1467,72 @@ GRANT EXECUTE ON FUNCTION podcast.get_admin_reach(integer)       TO authenticate
 -- (migrations 023 / 025 / 026).
 REVOKE UPDATE ON podcast.profiles FROM authenticated;
 REVOKE UPDATE ON podcast.profiles FROM anon;
-GRANT UPDATE (full_name, avatar_url, username, updated_at) ON podcast.profiles TO authenticated;
+-- full_name and username are set at sign-up by the service role; leaving them
+-- user-writable let a listener rename themselves after the show (039).
+GRANT UPDATE (avatar_url, updated_at) ON podcast.profiles TO authenticated;
 GRANT UPDATE ON podcast.profiles TO service_role;
+
+-- Migration 037. These must follow the blanket GRANTs above, which re-add them
+-- every time this file runs.
+--
+-- increment_play_count is SECURITY DEFINER: callable by anon, it let anyone
+-- set any episode's play count through PostgREST. Only /api/stream calls it,
+-- with the service role. (PUBLIC holds EXECUTE on every new function by default.)
+REVOKE EXECUTE ON FUNCTION podcast.increment_play_count(uuid) FROM PUBLIC, anon, authenticated;
+GRANT  EXECUTE ON FUNCTION podcast.increment_play_count(uuid) TO service_role;
+REVOKE EXECUTE ON FUNCTION podcast.delete_playlist(uuid) FROM PUBLIC, anon;
+-- The admin analytics functions refuse non-admins themselves, but anon never
+-- needs to reach them at all — and still could, through PUBLIC's default grant.
+REVOKE EXECUTE ON FUNCTION podcast.get_admin_dashboard(integer)   FROM PUBLIC, anon;
+REVOKE EXECUTE ON FUNCTION podcast.get_admin_timeseries(integer)  FROM PUBLIC, anon;
+REVOKE EXECUTE ON FUNCTION podcast.get_admin_track_stats(integer) FROM PUBLIC, anon;
+REVOKE EXECUTE ON FUNCTION podcast.get_admin_reach(integer)       FROM PUBLIC, anon;
+REVOKE EXECUTE ON FUNCTION podcast.get_play_analytics(integer)    FROM PUBLIC, anon;
+REVOKE EXECUTE ON FUNCTION podcast.get_play_timeseries(integer)   FROM PUBLIC, anon;
+-- Nothing anonymous ever writes, and only the service role writes these two.
+-- RLS already refused these, but one permissive policy added later would have
+-- opened the table to anyone holding the public anon key.
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA podcast FROM anon;
+REVOKE TRUNCATE ON ALL TABLES IN SCHEMA podcast FROM authenticated;
+REVOKE INSERT, UPDATE, DELETE ON podcast.play_events       FROM authenticated;
+REVOKE INSERT, UPDATE, DELETE ON podcast.schema_migrations FROM authenticated;
+-- Migration 038: the second-factor table is service-role only — the blanket
+-- GRANT above would otherwise hand it to anon and authenticated.
+REVOKE ALL ON podcast.admin_sessions FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON podcast.admin_sessions TO service_role;
+REVOKE EXECUTE ON FUNCTION podcast.admin_session_verified() FROM PUBLIC, anon;
+GRANT  EXECUTE ON FUNCTION podcast.admin_session_verified() TO authenticated, service_role;
+REVOKE EXECUTE ON FUNCTION podcast.refresh_playlist_stats(uuid) FROM PUBLIC, anon, authenticated;
+-- Migration 039. Nothing in the app UPDATEs a like or a comment, and the count
+-- triggers only follow INSERT/DELETE — so UPDATE let a row be re-pointed at
+-- another episode to inflate or zero its counts. INSERT is limited to the
+-- columns the app sends, so clients cannot choose created_at.
+REVOKE INSERT, UPDATE ON podcast.favorites FROM authenticated;
+REVOKE INSERT, UPDATE ON podcast.comments  FROM authenticated;
+GRANT INSERT (track_id, user_id)                  ON podcast.favorites TO authenticated;
+GRANT INSERT (track_id, user_id, body, parent_id) ON podcast.comments  TO authenticated;
+REVOKE EXECUTE ON FUNCTION podcast.throttle_comments() FROM PUBLIC, anon, authenticated;
+
+-- SECURITY DEFINER functions run as their owner; a caller-controlled
+-- search_path must not be able to redirect anything they reference. Set here
+-- rather than in each CREATE because CREATE OR REPLACE without a SET clause
+-- would clear it again on every run of this file.
+ALTER FUNCTION podcast.get_play_analytics(integer)     SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.get_play_timeseries(integer)    SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.get_user_role(uuid)             SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.handle_new_user()               SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.increment_play_count(uuid)      SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.is_admin()                      SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.is_super_admin()                SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.update_comment_count()          SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.update_favorite_count()         SET search_path = pg_catalog, podcast;
+ALTER FUNCTION podcast.update_playlist_stats()         SET search_path = pg_catalog, podcast;
+-- Dashboard days ("today", daily buckets) follow India time, not UTC (040).
+ALTER FUNCTION podcast.get_admin_dashboard(integer)  SET timezone = 'Asia/Kolkata';
+ALTER FUNCTION podcast.get_admin_timeseries(integer) SET timezone = 'Asia/Kolkata';
+ALTER FUNCTION podcast.get_play_analytics(integer)   SET timezone = 'Asia/Kolkata';
+ALTER FUNCTION podcast.get_play_timeseries(integer)  SET timezone = 'Asia/Kolkata';
+ALTER FUNCTION podcast.user_has_permission(uuid, text) SET search_path = pg_catalog, podcast;
 
 
 -- =============================================================================
@@ -1408,7 +1564,7 @@ DROP POLICY IF EXISTS "podcast_audio_admin_upload" ON storage.objects;
 CREATE POLICY "podcast_audio_admin_upload" ON storage.objects
     AS PERMISSIVE
     FOR INSERT TO authenticated
-    WITH CHECK (((bucket_id = 'podcast-audio'::text) AND podcast.user_has_permission(auth.uid(), 'tracks:create'::text)));
+    WITH CHECK (((bucket_id = 'podcast-audio'::text) AND podcast.is_admin()));
 
 -- Playback never reads this bucket directly — every play goes through
 -- /api/stream/[id], which fetches the track via the cookie-scoped client
@@ -1461,11 +1617,15 @@ CREATE POLICY "podcast_images_admin_upload" ON storage.objects
     FOR INSERT TO authenticated
     WITH CHECK (((bucket_id = 'podcast-images'::text) AND podcast.is_admin()));
 
+-- Public buckets serve /object/public/ URLs without consulting RLS, so these
+-- SELECT policies only govern the list/API endpoints. A public SELECT let anyone
+-- enumerate every cover, drafts included — admin-only since 040.
 DROP POLICY IF EXISTS "podcast_images_public_read" ON storage.objects;
-CREATE POLICY "podcast_images_public_read" ON storage.objects
+DROP POLICY IF EXISTS "podcast_images_admin_read" ON storage.objects;
+CREATE POLICY "podcast_images_admin_read" ON storage.objects
     AS PERMISSIVE
-    FOR SELECT TO public
-    USING ((bucket_id = 'podcast-images'::text));
+    FOR SELECT TO authenticated
+    USING (((bucket_id = 'podcast-images'::text) AND podcast.is_admin()));
 
 DROP POLICY IF EXISTS "podcast_thumbnails_admin_delete" ON storage.objects;
 CREATE POLICY "podcast_thumbnails_admin_delete" ON storage.objects
@@ -1480,10 +1640,11 @@ CREATE POLICY "podcast_thumbnails_admin_upload" ON storage.objects
     WITH CHECK (((bucket_id = 'podcast-thumbnails'::text) AND podcast.is_admin()));
 
 DROP POLICY IF EXISTS "podcast_thumbnails_public_read" ON storage.objects;
-CREATE POLICY "podcast_thumbnails_public_read" ON storage.objects
+DROP POLICY IF EXISTS "podcast_thumbnails_admin_read" ON storage.objects;
+CREATE POLICY "podcast_thumbnails_admin_read" ON storage.objects
     AS PERMISSIVE
-    FOR SELECT TO public
-    USING ((bucket_id = 'podcast-thumbnails'::text));
+    FOR SELECT TO authenticated
+    USING (((bucket_id = 'podcast-thumbnails'::text) AND podcast.is_admin()));
 
 
 
@@ -1603,8 +1764,15 @@ INSERT INTO podcast.schema_migrations (version) VALUES
     ('033_playlist_delete_via_rpc'),
     ('034_security_audit_hardening'),
     ('035_analytics_reach_and_dashboard'),
-    ('036_hard_delete_tracks_keep_play_history')
+    ('036_hard_delete_tracks_keep_play_history'),
+    ('037_lock_down_public_writes'),
+    ('038_admin_second_factor_and_playlist_stats'),
+    ('039_lock_down_engagement_writes'),
+    ('040_ist_analytics_and_private_cover_listing')
 ON CONFLICT DO NOTHING;
+
+-- Playlist figures under the published-only rule (038); a no-op when current.
+SELECT podcast.refresh_playlist_stats(id) FROM podcast.playlists;
 
 -- =============================================================================
 -- AFTER RUNNING THIS FILE

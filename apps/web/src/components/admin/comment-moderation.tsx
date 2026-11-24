@@ -1,11 +1,11 @@
 'use client';
 
 import { addComment, deleteComment } from '@/app/actions';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { runAction } from '@/lib/run-action';
 import {
   type CommentRow,
   buildThreads,
-  commentAuthorName,
   formatCommentDate,
   removeWithReplies,
 } from '@/lib/comments';
@@ -30,6 +30,9 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
   const [replyTo, setReplyTo] = useState<string | null>(null);
   const [replyText, setReplyText] = useState('');
   const [pending, startTransition] = useTransition();
+  // The comment awaiting confirmation. Deleting is one click away from Reply
+  // and takes every reply in the thread with it, so it asks first.
+  const [confirming, setConfirming] = useState<ModRow | null>(null);
 
   const threads = useMemo(() => buildThreads(items), [items]);
 
@@ -44,14 +47,16 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
         toast.error(res.error);
         return;
       }
-      const c = res.comment as CommentRow;
+      // addComment returns the author already resolved to a display name;
+      // commentAuthorName() expects a profile row and turned it into "Listener".
+      const c = res.comment as Omit<CommentRow, 'author'> & { author: string };
       setItems((prev) => [
         {
           id: c.id,
           body: c.body,
           created_at: c.created_at,
           parent_id: root.id,
-          author: commentAuthorName(c.author),
+          author: c.author,
           trackId: root.trackId,
           trackTitle: root.trackTitle,
           trackSlug: root.trackSlug,
@@ -65,6 +70,7 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
   }
 
   function remove(id: string) {
+    setConfirming(null);
     startTransition(async () => {
       const res = await runAction(() => deleteComment(id));
       if ('error' in res && res.error) {
@@ -124,7 +130,7 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
             </button>
             <button
               type="button"
-              onClick={() => remove(root.id)}
+              onClick={() => setConfirming(root)}
               disabled={pending}
               className="inline-flex items-center gap-1 text-xs font-semibold text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
             >
@@ -149,7 +155,7 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
                     </time>
                     <button
                       type="button"
-                      onClick={() => remove(r.id)}
+                      onClick={() => setConfirming(r)}
                       disabled={pending}
                       aria-label="Delete reply"
                       className="text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
@@ -185,6 +191,21 @@ export function CommentModeration({ rows }: { rows: ModRow[] }) {
           )}
         </div>
       ))}
+      {confirming && (
+        <ConfirmDialog
+          open
+          title={confirming.parent_id ? 'Delete this reply?' : 'Delete this comment?'}
+          description={
+            confirming.parent_id
+              ? `The reply from ${confirming.author} is removed from the episode page.`
+              : `The comment from ${confirming.author} and every reply to it are removed from the episode page. This cannot be undone.`
+          }
+          confirmLabel="Delete"
+          busy={pending}
+          onConfirm={() => remove(confirming.id)}
+          onCancel={() => setConfirming(null)}
+        />
+      )}
     </div>
   );
 }

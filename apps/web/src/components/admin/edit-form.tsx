@@ -3,6 +3,7 @@
 import { adminCreatePlaylist, adminDiscardUpload, adminUpdatePodcast } from '@/app/actions';
 import { CoverArtField } from '@/components/admin/cover-art-field';
 import { PlatformLinkFields } from '@/components/admin/platform-link-fields';
+import { buildKeywords, buildMetaDescription } from '@/lib/seo/generate';
 import { SeoFields, type SeoOverrides } from '@/components/admin/seo-fields';
 import {
   ChipPicker,
@@ -15,9 +16,10 @@ import {
   readDuration,
   uploadAudio,
   uploadCover,
+  useWarnBeforeLeaving,
 } from '@/components/admin/upload-form';
 import { type PlatformLinks, parsePlatformLinks } from '@/lib/platforms';
-import { MAX_AUDIO_BYTES, TRACK_LIMITS, formatDuration } from '@/lib/podcast';
+import { MAX_AUDIO_BYTES, TRACK_LIMITS, formatBytes, formatDuration } from '@/lib/podcast';
 import { ACTION_FAILED, runAction } from '@/lib/run-action';
 import { createClient } from '@/lib/supabase/client';
 import { motion } from 'framer-motion';
@@ -61,13 +63,29 @@ export function EditForm({
   const [audio, setAudio] = useState<File | null>(null);
   const [cover, setCover] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
+  useWarnBeforeLeaving(busy);
   const [progress, setProgress] = useState('');
   const [pct, setPct] = useState(0);
-  // Prefilled from what is already stored, so the panel shows the live values
-  // rather than re-deriving them and implying an edit that never happened.
-  const [seo, setSeo] = useState<SeoOverrides>({
-    metaDescription: track.meta_description ?? '',
-    keywords: (track.keywords ?? []).join(', '),
+  // A stored value counts as a manual override only if it differs from what
+  // the generator makes of the episode as it stands. Prefilling the generated
+  // copy sent it back as an "override" on every save, which froze the meta
+  // description and keywords on the episode's first title forever.
+  const [seo, setSeo] = useState<SeoOverrides>(() => {
+    const facts = {
+      title: track.title || 'Untitled episode',
+      playlistTitle: initialPlaylists.find((p) => p.id === currentPlaylistId)?.title ?? null,
+      durationSeconds: track.duration_seconds || 600,
+      description: track.description ?? '',
+    };
+    const storedMeta = track.meta_description ?? '';
+    const storedKeywords = (track.keywords ?? []).join(', ');
+    return {
+      metaDescription:
+        storedMeta === buildMetaDescription(facts).slice(0, TRACK_LIMITS.metaDescription)
+          ? ''
+          : storedMeta,
+      keywords: storedKeywords === buildKeywords(facts).join(', ') ? '' : storedKeywords,
+    };
   });
   const [platformLinks, setPlatformLinks] = useState<PlatformLinks>(() =>
     parsePlatformLinks(track.platform_links),
@@ -92,7 +110,7 @@ export function EditForm({
       return;
     }
     if (audio && audio.size > MAX_AUDIO_BYTES) {
-      toast.error(`That file is over the ${MAX_AUDIO_BYTES / 1024 / 1024} MB limit.`);
+      toast.error(`That file is over the ${formatBytes(MAX_AUDIO_BYTES)} limit.`);
       return;
     }
 
@@ -250,6 +268,7 @@ export function EditForm({
         playlistTitle={playlists.find((p) => p.id === playlistId)?.title ?? null}
         description={description}
         durationSeconds={track.duration_seconds}
+        slug={track.slug}
         overrides={seo}
         onChange={setSeo}
       />

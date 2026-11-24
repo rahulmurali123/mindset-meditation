@@ -30,6 +30,14 @@ export function LikeButton({
         setSaved(prev);
         setCount((c) => c + (prev ? 1 : -1));
         toast.error(res.error);
+        return;
+      }
+      // toggleSave flips whatever the SERVER holds. If the player's heart
+      // already changed it, the optimistic guess above is backwards — trust
+      // the answer, and correct the count to match.
+      if ('saved' in res && typeof res.saved === 'boolean' && res.saved !== !prev) {
+        setSaved(res.saved);
+        setCount((c) => Math.max(0, c + (res.saved ? 1 : -1)));
       }
     });
   }

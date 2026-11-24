@@ -83,6 +83,23 @@ export async function issueToken(userId: string): Promise<{ value: string; maxAg
   return { value: `${payload}.${await sign(payload)}`, maxAge: TTL_SECONDS };
 }
 
+/** Cookie attributes for the verification token, shared by every writer. */
+export function adminCookieOptions(maxAge: number) {
+  return {
+    httpOnly: true,
+    sameSite: 'lax' as const,
+    secure: process.env.NODE_ENV === 'production',
+    path: '/',
+    maxAge,
+  };
+}
+
+/** When the token stops being honoured (ms since epoch), without checking its signature. */
+export function tokenExpiresAt(token: string | undefined): number | null {
+  const expires = Number(token?.split('.')[1]);
+  return Number.isFinite(expires) ? expires : null;
+}
+
 /**
  * Node-runtime guard used by the admin layout and the admin API routes.
  * Returns true only when the caller holds a valid, unexpired token for this

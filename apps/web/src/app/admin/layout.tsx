@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import { redirect } from 'next/navigation';
 import Link from 'next/link';
-import { Upload, ListMusic, ArrowLeft, MessageCircle, BarChart3 } from 'lucide-react';
+import { Upload, ListMusic, ArrowLeft, MessageCircle, BarChart3, Headphones } from 'lucide-react';
 import { BRAND } from '@/lib/brand';
 import { checkAdmin } from '@/lib/admin-guard';
 
@@ -9,6 +9,7 @@ export const dynamic = 'force-dynamic';
 
 const NAV = [
   { href: '/admin/playlists', label: 'Manage', icon: ListMusic },
+  { href: '/admin/episodes', label: 'Episodes', icon: Headphones },
   { href: '/admin/upload', label: 'Upload', icon: Upload },
   { href: '/admin/analytics', label: 'Analytics', icon: BarChart3 },
   { href: '/admin/comments', label: 'Comments', icon: MessageCircle },

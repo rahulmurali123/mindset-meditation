@@ -52,8 +52,15 @@ function country(h: Headers): string | null {
  * Self-referrals are dropped: a listener moving between pages of this site is
  * not a traffic source, and counting them would swamp every real referrer.
  */
-function referrerHost(h: Headers, selfHost: string | null): string | null {
-  const raw = h.get('referer') ?? h.get('referrer');
+function referrerHost(
+  h: Headers,
+  selfHost: string | null,
+  landing: string | null,
+): string | null {
+  // The player's own fetch always carries this site's page as its Referer, so
+  // the page's document.referrer — where the visit started — is preferred
+  // when the player passes it. Without it every play read as "Direct".
+  const raw = landing || h.get('referer') || h.get('referrer');
   if (!raw) return null;
   try {
     const host = new URL(raw).hostname.replace(/^www\./, '');
@@ -136,11 +143,15 @@ function os(ua: string): string | null {
  * Reads every field at once. Never throws: a play must be recorded even if a
  * header is malformed, so each extractor degrades to null on its own.
  */
-export function requestContext(headers: Headers, selfHost: string | null = null): RequestContext {
+export function requestContext(
+  headers: Headers,
+  selfHost: string | null = null,
+  landingReferrer: string | null = null,
+): RequestContext {
   const ua = headers.get('user-agent') ?? '';
   return {
     country: country(headers),
-    referrer_host: referrerHost(headers, selfHost),
+    referrer_host: referrerHost(headers, selfHost, landingReferrer),
     device_type: deviceType(ua),
     browser: browser(ua),
     os: os(ua),

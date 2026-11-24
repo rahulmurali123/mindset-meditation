@@ -82,7 +82,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   async function signOut() {
     // Drop the admin second-factor cookie too, so the code is required again.
     await clearAdminVerification().catch(() => {});
-    await supabase.auth.signOut();
+    // This device only — signing out on a phone should not end the session on
+    // every other device too, which is what the default global scope did.
+    await supabase.auth.signOut({ scope: 'local' });
     setUser(null);
     setSession(null);
     router.push('/');

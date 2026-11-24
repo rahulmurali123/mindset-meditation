@@ -38,3 +38,32 @@ export function describeSupabaseError(error: SupabaseLikeError): string {
 export function logSupabaseError(scope: string, error: SupabaseLikeError): void {
   console.error(`[${scope}] ${describeSupabaseError(error)}`);
 }
+
+/**
+ * For cached (ISR) pages and feeds: refuse to render a catalogue we could not
+ * read.
+ *
+ * These pages used to ignore `error` and render the empty result. During an
+ * outage that empty render then replaced the good cached copy — the homepage
+ * said "no episodes", and /feed.xml went out with zero items to every podcast
+ * directory polling it, which is how episodes get dropped from Apple/Spotify.
+ * Throwing instead makes Next keep serving the last good version until a
+ * revalidation succeeds.
+ *
+ * During `next build` it throws too, failing the build: a release built while
+ * Supabase is unreachable would otherwise ship an empty catalogue, and
+ * scripts/deploy.sh keeps the live release when the build fails. The one
+ * exception is CI (CI=true), which builds against a placeholder project on
+ * purpose and never deploys what it builds.
+ */
+export function throwIfUnavailable(scope: string, error: SupabaseLikeError | null): void {
+  if (!error) return;
+  logSupabaseError(scope, error);
+  if (process.env.NEXT_PHASE === 'phase-production-build') {
+    if (process.env.CI === 'true') return;
+    throw new Error(
+      `[${scope}] Supabase could not be read during the build — refusing to bake an empty catalogue into this release. Check /api/health on the live site and the Supabase project, then build again.`,
+    );
+  }
+  throw new Error(`[${scope}] catalogue unavailable — keeping the cached version`);
+}

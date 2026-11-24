@@ -59,6 +59,7 @@ export function PlaylistForm({ playlist }: { playlist?: EditablePlaylist }) {
       if ('error' in res && res.error) throw new Error(res.error);
 
       toast.success(playlist ? 'Playlist saved' : 'Playlist created');
+      if ('warning' in res && res.warning) toast.warning(res.warning);
       router.push('/admin/playlists');
       router.refresh();
     } catch (err) {

@@ -10,6 +10,7 @@ import { EpisodeRow, type EpisodeItem } from '@/components/podcast/episode-row';
 import { PlaylistPlayButton } from '@/components/playlist/playlist-play-button';
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/reveal';
 import { createPublicClient } from '@/lib/supabase/public';
+import { throwIfUnavailable } from '@/lib/supabase/errors';
 import { PODCAST_SELECT, formatPlaylistMeta, type EpisodeSummary } from '@/lib/podcast';
 import { FALLBACK_COVER_GRADIENT } from '@/lib/fallback-cover';
 import { BRAND } from '@/lib/brand';
@@ -44,6 +45,9 @@ export async function generateStaticParams() {
       .from('playlists')
       .select('slug')
       .eq('is_public', true)
+      // Only playlists with a published episode: an empty or draft-only one
+      // (e.g. created inline from the upload form) is not public content yet.
+      .gt('track_count', 0)
       .is('deleted_at', null)
       .not('slug', 'is', null)
       .limit(500);
@@ -57,13 +61,19 @@ export async function generateStaticParams() {
 
 async function getPlaylist(slug: string) {
   const supabase = createPublicClient();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('playlists')
     .select('id, title, slug, description, thumbnail_url, track_count, total_duration_seconds')
     .eq('slug', slug)
     .eq('is_public', true)
+    // Only playlists with a published episode: an empty or draft-only one
+    // (e.g. created inline from the upload form) is not public content yet.
+    .gt('track_count', 0)
     .is('deleted_at', null)
     .maybeSingle();
+  // An outage is not "no such playlist": a 404 here would be cached and
+  // reported to search engines for a page that exists.
+  throwIfUnavailable('playlist', error);
   return data as {
     id: string;
     title: string;
@@ -104,11 +114,12 @@ export default async function PlaylistPage({ params }: { params: Promise<{ slug:
   if (!playlist) notFound();
 
   const supabase = createPublicClient();
-  const { data: rows } = await supabase
+  const { data: rows, error: rowsError } = await supabase
     .from('playlist_tracks')
     .select(`position, track:tracks(${PODCAST_SELECT})`)
     .eq('playlist_id', playlist.id)
     .order('position', { ascending: true });
+  throwIfUnavailable('playlist', rowsError);
 
   // Drafts and soft-deleted episodes are filtered out by the tracks RLS policy
   // for visitors, which surfaces here as a null embed.

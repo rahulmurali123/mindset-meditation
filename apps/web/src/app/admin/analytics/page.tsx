@@ -110,7 +110,7 @@ export default async function AnalyticsPage({
           </h1>
           <p className="text-sm text-muted-foreground">
             Audience, engagement and reach across {rangeLabel}. Changes compare against the
-            preceding period of the same length.
+            preceding period of the same length. Days run midnight to midnight, India time.
           </p>
         </div>
         <RangeTabs active={days} />
@@ -282,15 +282,17 @@ export default async function AnalyticsPage({
 
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           <Breakdown
+            total={plays}
             title="Traffic source"
             entries={reach.referrer}
             emptyLabel="No plays recorded in this period."
           />
-          <Breakdown title="Device" entries={reach.device} />
-          <Breakdown title="Operating system" entries={reach.os} />
-          <Breakdown title="Browser" entries={reach.browser} />
-          <Breakdown title="Language" entries={reach.language} />
+          <Breakdown total={plays} title="Device" entries={reach.device} />
+          <Breakdown total={plays} title="Operating system" entries={reach.os} />
+          <Breakdown total={plays} title="Browser" entries={reach.browser} />
+          <Breakdown total={plays} title="Language" entries={reach.language} />
           <Breakdown
+            total={plays}
             title="Country"
             entries={s.has_geo ? reach.country : undefined}
             emptyLabel="Country needs a CDN in front of the app to supply a geo header. This deployment has none, so location is not recorded."

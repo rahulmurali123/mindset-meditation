@@ -34,6 +34,9 @@ export const getShow = cache(async (): Promise<Show> => {
       .from('playlists')
       .select('thumbnail_url')
       .eq('is_public', true)
+      // Only playlists with a published episode: an empty or draft-only one
+      // (e.g. created inline from the upload form) is not public content yet.
+      .gt('track_count', 0)
       .is('deleted_at', null)
       .not('thumbnail_url', 'is', null)
       .order('created_at', { ascending: false })

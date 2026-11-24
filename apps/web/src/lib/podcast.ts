@@ -20,8 +20,26 @@ export const TRACK_LIMITS = {
   metaDescription: 320,
 } as const;
 
-/** Largest audio file accepted, matching the podcast-audio bucket's limit. */
-export const MAX_AUDIO_BYTES = 200 * 1024 * 1024;
+/**
+ * Largest audio file accepted when audio goes to Cloudflare R2 (the production
+ * setup). 4 GiB covers a 3-hour episode even as uncompressed 24-bit WAV; a
+ * 3-hour MP3 is 170–430 MB. R2's multipart ceiling (10,000 × 8 MiB parts) is
+ * far above this, so the cap is a sanity limit, not a storage one.
+ */
+export const MAX_AUDIO_BYTES = 4 * 1024 * 1024 * 1024;
+
+/**
+ * Largest audio file the Supabase Storage fallback accepts — the podcast-audio
+ * bucket's file_size_limit in fullschema.sql. That path is one plain POST with
+ * no parts or resume, so it stays small; long episodes need R2.
+ */
+export const MAX_SUPABASE_AUDIO_BYTES = 200 * 1024 * 1024;
+
+/** "1.2 GB" / "340 MB" — for size limits and errors shown to the admin. */
+export function formatBytes(bytes: number): string {
+  const mb = bytes / 1024 / 1024;
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1).replace(/\.0$/, '')} GB` : `${Math.round(mb)} MB`;
+}
 
 /**
  * The subset of `tracks` every episode surface needs: cards, the hero player,
@@ -47,7 +65,7 @@ export interface EpisodeSummary {
 }
 
 /** An episode surface that shows a publish date needs it to actually be there. */
-export type DatedEpisode = EpisodeSummary & { created_at: string };
+export type DatedEpisode = EpisodeSummary & { created_at: string; published_at?: string | null };
 
 export function formatDuration(totalSeconds: number | null | undefined): string {
   const s = Math.max(0, Math.floor(totalSeconds ?? 0));
@@ -125,4 +143,27 @@ export function formatPlaylistMeta(trackCount: number, totalSeconds: number): st
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
   return `${tracks} · ${hours}h${rest ? ` ${rest}m` : ''}`;
+}
+
+const AUDIO_TYPES: Record<string, string> = {
+  mp3: 'audio/mpeg',
+  m4a: 'audio/mp4',
+  mp4: 'audio/mp4',
+  aac: 'audio/aac',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  oga: 'audio/ogg',
+  opus: 'audio/ogg',
+  flac: 'audio/flac',
+  webm: 'audio/webm',
+};
+
+/**
+ * MIME type of a stored episode, from its key's extension (keys keep the
+ * uploaded file's extension). The RSS feed and JSON-LD used to call every file
+ * audio/mpeg, so an .m4a or .webm upload was announced to podcast apps as MP3.
+ */
+export function audioMimeType(audioPath: string | null | undefined): string {
+  const ext = audioPath?.split('.').pop()?.toLowerCase() ?? '';
+  return AUDIO_TYPES[ext] ?? 'audio/mpeg';
 }

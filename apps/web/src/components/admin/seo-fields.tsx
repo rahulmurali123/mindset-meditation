@@ -33,6 +33,7 @@ export function SeoFields({
   playlistTitle,
   description,
   durationSeconds,
+  slug,
   overrides,
   onChange,
 }: {
@@ -41,6 +42,8 @@ export function SeoFields({
   description?: string;
   /** 0 until an audio file has been read. */
   durationSeconds: number;
+  /** An existing episode's URL, which never changes on rename. */
+  slug?: string;
   overrides: SeoOverrides;
   onChange: (next: SeoOverrides) => void;
 }) {
@@ -55,9 +58,9 @@ export function SeoFields({
       metaDescription: buildMetaDescription(facts),
       excerpt: buildExcerpt(facts),
       keywords: buildKeywords(facts),
-      slug: slugify(title || 'untitled-episode'),
+      slug: slug || slugify(title || 'untitled-episode'),
     };
-  }, [title, playlistTitle, description, durationSeconds]);
+  }, [title, playlistTitle, description, durationSeconds, slug]);
 
   const metaDescription = overrides.metaDescription || generated.metaDescription;
   const keywords = overrides.keywords

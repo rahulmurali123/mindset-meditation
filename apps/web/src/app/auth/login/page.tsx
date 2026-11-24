@@ -30,7 +30,11 @@ function LoginForm() {
   const [password, setPassword] = useState('');
   const [remember, setRemember] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<{ message: string; field?: string } | null>(null);
+  const [error, setError] = useState<{ message: string; field?: string } | null>(() =>
+    searchParams.get('error') === 'link_expired'
+      ? { message: 'That sign-in link is invalid or has expired. Please sign in again.' }
+      : null,
+  );
 
   /** Caught before the round-trip so obvious mistakes answer instantly. */
   function localError(): { message: string; field: string } | null {

@@ -1,7 +1,10 @@
 'use client';
 
-import { createContext, useContext, useRef, useEffect, useState, useCallback } from 'react';
+import { createContext, useContext, useRef, useEffect, useCallback } from 'react';
 import { Lock } from 'lucide-react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { toast } from 'sonner';
 import { usePlayerStore } from '@/store/player.store';
 import { useAuth } from '@/components/providers/auth-provider';
 import { BRAND } from '@/lib/brand';
@@ -35,39 +38,98 @@ const AudioPlayerContext = createContext<AudioPlayerContextValue | null>(null);
  * Stable per-browser id so anonymous listeners can be told apart in analytics
  * without any tracking cookie. Lives in localStorage; regenerating it just
  * counts that browser as a new listener.
+ *
+ * Storage can throw (site data blocked, some private modes). That used to land
+ * in play()'s catch, so nothing played and nothing said why. A per-tab id is
+ * the fallback — playback must never depend on analytics.
  */
+let memoryListenerId: string | null = null;
 function listenerSessionId(): string {
   if (typeof window === 'undefined') return '';
   const KEY = 'mm-listener-session';
-  let id = window.localStorage.getItem(KEY);
-  if (!id) {
-    id = crypto.randomUUID();
-    window.localStorage.setItem(KEY, id);
+  try {
+    let id = window.localStorage.getItem(KEY);
+    if (!id) {
+      id = crypto.randomUUID();
+      window.localStorage.setItem(KEY, id);
+    }
+    return id;
+  } catch {
+    memoryListenerId ??= crypto.randomUUID();
+    return memoryListenerId;
   }
-  return id;
 }
+
+/**
+ * Where this visit came from: document.referrer as it was on the first page of
+ * the tab's session. The player's own requests always carry this site as their
+ * Referer, so the stream route cannot see the real source itself. Kept for the
+ * session because client-side navigation does not update document.referrer.
+ */
+function landingReferrer(): string {
+  if (typeof window === 'undefined') return '';
+  const KEY = 'mm-landing-ref';
+  try {
+    let ref = window.sessionStorage.getItem(KEY);
+    if (ref === null) {
+      ref = document.referrer || '';
+      window.sessionStorage.setItem(KEY, ref);
+    }
+    return ref;
+  } catch {
+    return document.referrer || '';
+  }
+}
+
+/** Live store state. Handlers registered once must read this, not a render's snapshot. */
+const live = () => usePlayerStore.getState();
 
 export function AudioPlayerProvider({ children }: { children: React.ReactNode }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const store = usePlayerStore();
+  // Only what the provider itself renders; everything else is read live.
+  const previewEnded = usePlayerStore((s) => s.previewEnded);
+  const sleepTimerEndsAt = usePlayerStore((s) => s.sleepTimerEndsAt);
   const { user } = useAuth();
-  const [wakeLock, setWakeLock] = useState<WakeLockSentinel | null>(null);
+  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   // The timeupdate listener is registered once, so it would close over a stale
   // `user`. A ref keeps the signed-in state current inside that callback.
   const isSignedInRef = useRef(false);
   // Analytics for the episode currently playing.
   const playEventRef = useRef<string | null>(null);
   const reportedRef = useRef(0);
+  // Seconds of the current episode actually played, and where the playhead was
+  // on the last timeupdate. Progress used to report the playhead position, so
+  // seeking to the end counted as a full listen and pressing "previous" wiped
+  // twenty heard minutes back to zero.
+  const heardRef = useRef(0);
+  const lastPosRef = useRef(0);
+  // Each play() call takes a ticket; a slower, older call that resolves after a
+  // newer one must not take over the player.
+  const playTicketRef = useRef(0);
+  // Handlers registered once (audio 'ended', lock-screen controls) call these
+  // through refs so they always run the current implementation.
+  const skipNextRef = useRef<() => void>(() => {});
+  const skipPrevRef = useRef<() => void>(() => {});
+  const recoverRef = useRef<() => void>(() => {});
+  // When the URL was last replaced after an error, so a file that is genuinely
+  // broken fails once instead of re-requesting a URL in a loop.
+  const recoveredAtRef = useRef(0);
+  const pathname = usePathname();
 
   useEffect(() => {
     isSignedInRef.current = !!user;
   }, [user]);
 
-  /** Sends how far the listener got. Throttled to once per 15s of playback. */
-  const reportProgress = useCallback((seconds: number, force = false) => {
+  // Read on first load, before client-side navigation can matter.
+  useEffect(() => {
+    landingReferrer();
+  }, []);
+
+  /** Sends how much the listener has heard. Throttled to once per 15s of playback. */
+  const reportProgress = useCallback((force = false) => {
     const eventId = playEventRef.current;
     if (!eventId) return;
-    const whole = Math.floor(seconds);
+    const whole = Math.floor(heardRef.current);
     if (!force && whole - reportedRef.current < 15) return;
     reportedRef.current = whole;
 
@@ -87,119 +149,182 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
     });
   }, []);
 
+  const releaseWakeLock = useCallback(() => {
+    const lock = wakeLockRef.current;
+    wakeLockRef.current = null;
+    lock?.release().catch(() => {});
+  }, []);
+
+  const requestWakeLock = useCallback(async () => {
+    if (!('wakeLock' in navigator)) return;
+    // One lock at a time: every resume used to take a new one and none were
+    // ever released, so the screen stayed on after pausing.
+    releaseWakeLock();
+    try {
+      wakeLockRef.current = await navigator.wakeLock.request('screen');
+    } catch {
+      // Wake lock not supported or permission denied
+    }
+  }, [releaseWakeLock]);
+
   // Initialize audio element
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const audio = new Audio();
     audio.preload = 'metadata';
+    // The saved volume and mute were shown in the UI but never applied, so a
+    // listener who had turned it down got full volume after every reload.
+    audio.volume = live().volume;
+    audio.muted = live().isMuted;
     audioRef.current = audio;
 
+    const unsubscribe = usePlayerStore.subscribe((s) => {
+      if (audio.volume !== s.volume) audio.volume = s.volume;
+      if (audio.muted !== s.isMuted) audio.muted = s.isMuted;
+    });
+
     audio.addEventListener('timeupdate', () => {
-      store.setCurrentTime(audio.currentTime);
-      reportProgress(audio.currentTime);
+      live().setCurrentTime(audio.currentTime);
+      // Only small forward steps are listening; a jump is a seek.
+      const step = audio.currentTime - lastPosRef.current;
+      if (step > 0 && step < 5) heardRef.current += step;
+      lastPosRef.current = audio.currentTime;
+      reportProgress();
       // Preview limit is for signed-OUT listeners only.
       if (!isSignedInRef.current && audio.currentTime >= PREVIEW_SECONDS) {
         audio.pause();
-        reportProgress(audio.currentTime, true);
-        const s = usePlayerStore.getState();
+        reportProgress(true);
+        const s = live();
         s.setIsPlaying(false);
         if (!s.previewEnded) s.setPreviewEnded(true);
       }
     });
 
-    audio.addEventListener('pause', () => reportProgress(audio.currentTime, true));
+    audio.addEventListener('seeked', () => {
+      lastPosRef.current = audio.currentTime;
+    });
+
+    audio.addEventListener('pause', () => reportProgress(true));
 
     // Catch listeners who close the tab mid-episode.
-    const flush = () => reportProgress(audio.currentTime, true);
+    const flush = () => reportProgress(true);
     window.addEventListener('pagehide', flush);
 
     audio.addEventListener('loadedmetadata', () => {
-      store.setDuration(audio.duration);
+      live().setDuration(audio.duration);
     });
 
+    // Read live: this listener is registered once, and the render-time store it
+    // used to close over always had an empty queue and the page-load repeat
+    // setting — so episodes never auto-advanced and the repeat toggle did nothing.
     audio.addEventListener('ended', () => {
-      if (store.isRepeat) {
+      if (live().isRepeat) {
         audio.currentTime = 0;
-        audio.play();
+        audio.play().catch(() => live().setIsPlaying(false));
       } else {
-        skipNext();
+        skipNextRef.current();
       }
     });
 
-    audio.addEventListener('waiting', () => store.setIsLoading(true));
-    audio.addEventListener('canplay', () => store.setIsLoading(false));
+    // The signed URL has a lifetime, and the browser keeps making range
+    // requests against it as it plays and seeks. Past expiry (a long episode,
+    // or one paused for hours) those are refused and the element errors out.
+    audio.addEventListener('error', () => recoverRef.current());
 
-    // Media Session API
+    audio.addEventListener('waiting', () => live().setIsLoading(true));
+    audio.addEventListener('canplay', () => live().setIsLoading(false));
+
+    // Media Session API (lock screen, headphones, car controls)
     if ('mediaSession' in navigator) {
       navigator.mediaSession.setActionHandler('play', () => {
-        audio.play();
-        store.setIsPlaying(true);
+        audio
+          .play()
+          .then(() => live().setIsPlaying(true))
+          .catch(() => {});
       });
       navigator.mediaSession.setActionHandler('pause', () => {
         audio.pause();
-        store.setIsPlaying(false);
+        live().setIsPlaying(false);
       });
-      navigator.mediaSession.setActionHandler('nexttrack', skipNext);
-      navigator.mediaSession.setActionHandler('previoustrack', skipPrev);
+      navigator.mediaSession.setActionHandler('nexttrack', () => skipNextRef.current());
+      navigator.mediaSession.setActionHandler('previoustrack', () => skipPrevRef.current());
       navigator.mediaSession.setActionHandler('seekto', (details) => {
         if (details.seekTime !== undefined) {
           audio.currentTime = details.seekTime;
-          store.setCurrentTime(details.seekTime);
+          live().setCurrentTime(details.seekTime);
         }
       });
     }
 
     return () => {
+      unsubscribe();
       window.removeEventListener('pagehide', flush);
       audio.pause();
       audio.src = '';
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  async function requestWakeLock() {
-    if ('wakeLock' in navigator) {
-      try {
-        const lock = await navigator.wakeLock.request('screen');
-        setWakeLock(lock);
-      } catch {
-        // Wake lock not supported or permission denied
-      }
-    }
-  }
-
-  function releaseWakeLock() {
-    wakeLock?.release();
-    setWakeLock(null);
-  }
+  }, [reportProgress]);
 
   const play = useCallback(
     async (track: Track, queue: Track[] = []) => {
       const audio = audioRef.current;
       if (!audio) return;
+      const ticket = ++playTicketRef.current;
 
       try {
         // Flush the outgoing episode's progress before switching.
-        reportProgress(audio.currentTime, true);
+        reportProgress(true);
+
+        // Queue and position first, so Next/Previous and "Up next" follow the
+        // list the listener actually started from. queueIndex used to stay at
+        // whatever it was, so playing the 5th of a playlist made Next play the 2nd.
+        const s = live();
+        if (queue.length) {
+          const at = queue.findIndex((t) => t.id === track.id);
+          s.setQueue(at === -1 ? [track, ...queue] : queue);
+          s.setQueueIndex(at === -1 ? 0 : at);
+        } else {
+          const at = s.queue.findIndex((t) => t.id === track.id);
+          if (at === -1) {
+            s.setQueue([track]);
+            s.setQueueIndex(0);
+          } else {
+            s.setQueueIndex(at);
+          }
+        }
 
         const response = await fetch(
-          `/api/stream/${track.id}?sid=${encodeURIComponent(listenerSessionId())}`,
+          `/api/stream/${track.id}?sid=${encodeURIComponent(listenerSessionId())}&ref=${encodeURIComponent(landingReferrer())}`,
         );
-        const { url, eventId } = await response.json();
-        if (!url) return;
+        const { url, eventId } = await response.json().catch(() => ({}));
+        if (ticket !== playTicketRef.current) return; // a newer play() won
+        if (!url) {
+          live().setIsLoading(false);
+          live().setIsPlaying(false);
+          toast.error(
+            response.status === 404
+              ? 'This episode is no longer available.'
+              : 'Could not load this episode. Please try again.',
+          );
+          return;
+        }
+        recoveredAtRef.current = 0;
 
         playEventRef.current = eventId ?? null;
         reportedRef.current = 0;
+        heardRef.current = 0;
+        lastPosRef.current = 0;
 
         audio.src = url;
-        audio.playbackRate = store.playbackSpeed;
+        audio.playbackRate = live().playbackSpeed;
 
-        store.setCurrentTrack(track); // also resets previewEnded
-        store.setIsPlaying(true);
-        store.setIsLoading(true);
-        if (queue.length) store.setQueue(queue);
+        live().setCurrentTrack(track); // also resets previewEnded
+        live().setIsLoading(true);
 
         await audio.play();
+        if (ticket !== playTicketRef.current) return;
+        // Only now: if the browser refused to play (autoplay policy), the UI
+        // used to say "playing" over silence.
+        live().setIsPlaying(true);
         await requestWakeLock();
 
         if ('mediaSession' in navigator) {
@@ -214,43 +339,95 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
           navigator.mediaSession.playbackState = 'playing';
         }
       } catch {
-        store.setIsLoading(false);
+        if (ticket !== playTicketRef.current) return;
+        live().setIsPlaying(false);
+        live().setIsLoading(false);
       }
     },
-    [store],
+    [reportProgress, requestWakeLock],
   );
+
+  /**
+   * Swaps in a fresh URL for the current episode after the element errored,
+   * and carries on from the same position. ?refresh=1 keeps it the same play
+   * in analytics.
+   */
+  const recover = useCallback(async () => {
+    const audio = audioRef.current;
+    const { currentTrack, currentTime, isPlaying } = live();
+    // Errors after close() (src removed) or with nothing loaded are not failures.
+    if (!audio || !currentTrack || !audio.getAttribute('src')) return;
+    const ticket = playTicketRef.current;
+
+    if (Date.now() - recoveredAtRef.current < 30_000) {
+      live().setIsPlaying(false);
+      live().setIsLoading(false);
+      toast.error('This episode could not be played. Please try again later.');
+      return;
+    }
+    recoveredAtRef.current = Date.now();
+
+    try {
+      const response = await fetch(
+        `/api/stream/${currentTrack.id}?refresh=1&sid=${encodeURIComponent(listenerSessionId())}`,
+      );
+      const { url } = await response.json();
+      if (!url || ticket !== playTicketRef.current) throw new Error('no url');
+      audio.src = url;
+      audio.playbackRate = live().playbackSpeed;
+      audio.currentTime = currentTime;
+      if (isPlaying) await audio.play();
+    } catch {
+      if (ticket !== playTicketRef.current) return;
+      live().setIsPlaying(false);
+      live().setIsLoading(false);
+    }
+  }, []);
+  recoverRef.current = () => void recover();
 
   const pause = useCallback(() => {
     audioRef.current?.pause();
-    store.setIsPlaying(false);
+    live().setIsPlaying(false);
+    releaseWakeLock();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-  }, [store]);
+  }, [releaseWakeLock]);
 
   const resume = useCallback(async () => {
-    if (!audioRef.current) return;
+    const audio = audioRef.current;
+    if (!audio) return;
     // Signed-out listeners cannot resume past the preview limit.
-    if (!isSignedInRef.current && audioRef.current.currentTime >= PREVIEW_SECONDS) {
-      store.setPreviewEnded(true);
+    if (!isSignedInRef.current && audio.currentTime >= PREVIEW_SECONDS) {
+      live().setPreviewEnded(true);
       return;
     }
-    await audioRef.current.play();
-    store.setIsPlaying(true);
+    try {
+      await audio.play();
+    } catch {
+      live().setIsPlaying(false);
+      return;
+    }
+    live().setIsPlaying(true);
     await requestWakeLock();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-  }, [store]);
+  }, [requestWakeLock]);
 
   const skipNext = useCallback(() => {
-    const { queue, queueIndex } = store;
-    const nextIndex = store.isShuffle ? Math.floor(Math.random() * queue.length) : queueIndex + 1;
+    const { queue, queueIndex, isShuffle } = live();
+    let nextIndex = queueIndex + 1;
+    if (isShuffle && queue.length > 1) {
+      // A different episode, never a replay of the current one.
+      nextIndex = Math.floor(Math.random() * (queue.length - 1));
+      if (nextIndex >= queueIndex) nextIndex += 1;
+    }
 
     if (nextIndex < queue.length) {
-      store.setQueueIndex(nextIndex);
-      play(queue[nextIndex]);
+      live().setQueueIndex(nextIndex);
+      void play(queue[nextIndex]);
     } else {
-      store.setIsPlaying(false);
+      live().setIsPlaying(false);
       releaseWakeLock();
     }
-  }, [store, play]);
+  }, [play, releaseWakeLock]);
 
   const skipPrev = useCallback(() => {
     const audio = audioRef.current;
@@ -261,96 +438,75 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
       return;
     }
 
-    const prevIndex = store.queueIndex - 1;
+    const { queue, queueIndex } = live();
+    const prevIndex = queueIndex - 1;
     if (prevIndex >= 0) {
-      store.setQueueIndex(prevIndex);
-      play(store.queue[prevIndex]);
+      live().setQueueIndex(prevIndex);
+      void play(queue[prevIndex]);
     }
-  }, [store, play]);
+  }, [play]);
 
-  const seek = useCallback(
-    (seconds: number) => {
-      if (!audioRef.current) return;
-      audioRef.current.currentTime = seconds;
-      store.setCurrentTime(seconds);
-    },
-    [store],
-  );
+  skipNextRef.current = skipNext;
+  skipPrevRef.current = skipPrev;
 
-  const setVolume = useCallback(
-    (volume: number) => {
-      if (!audioRef.current) return;
-      audioRef.current.volume = volume;
-      store.setVolume(volume);
-    },
-    [store],
-  );
-
-  const toggleMute = useCallback(() => {
+  const seek = useCallback((seconds: number) => {
     if (!audioRef.current) return;
-    audioRef.current.muted = !store.isMuted;
-    store.setIsMuted(!store.isMuted);
-  }, [store]);
+    audioRef.current.currentTime = seconds;
+    live().setCurrentTime(seconds);
+  }, []);
 
-  const setPlaybackSpeed = useCallback(
-    (speed: number) => {
-      if (!audioRef.current) return;
-      audioRef.current.playbackRate = speed;
-      store.setPlaybackSpeed(speed);
-    },
-    [store],
-  );
+  // The element follows the store through the subscription above.
+  const setVolume = useCallback((volume: number) => live().setVolume(volume), []);
+  const toggleMute = useCallback(() => live().setIsMuted(!live().isMuted), []);
 
-  const toggleRepeat = useCallback(() => store.setIsRepeat(!store.isRepeat), [store]);
-  const toggleShuffle = useCallback(() => store.setIsShuffle(!store.isShuffle), [store]);
-  const setSleepTimer = useCallback(
-    (minutes: number | null) => {
-      store.setSleepTimer(minutes);
-      if (minutes) {
-        store.setSleepTimerEndsAt(Date.now() + minutes * 60 * 1000);
-      } else {
-        store.setSleepTimerEndsAt(null);
-      }
-    },
-    [store],
-  );
+  const setPlaybackSpeed = useCallback((speed: number) => {
+    if (audioRef.current) audioRef.current.playbackRate = speed;
+    live().setPlaybackSpeed(speed);
+  }, []);
 
-  const addToQueue = useCallback(
-    (track: Track) => {
-      store.setQueue([...store.queue, track]);
-    },
-    [store],
-  );
+  const toggleRepeat = useCallback(() => live().setIsRepeat(!live().isRepeat), []);
+  const toggleShuffle = useCallback(() => live().setIsShuffle(!live().isShuffle), []);
+  const setSleepTimer = useCallback((minutes: number | null) => {
+    live().setSleepTimer(minutes);
+    live().setSleepTimerEndsAt(minutes ? Date.now() + minutes * 60 * 1000 : null);
+  }, []);
+
+  const addToQueue = useCallback((track: Track) => {
+    const { queue } = live();
+    if (!queue.some((t) => t.id === track.id)) live().setQueue([...queue, track]);
+  }, []);
 
   const close = useCallback(() => {
+    playTicketRef.current++; // abandon any play() still in flight
     const audio = audioRef.current;
     if (audio) {
       audio.pause();
       // Reporting before the src is dropped, so the final position is recorded.
-      reportProgress(audio.currentTime, true);
+      reportProgress(true);
       audio.removeAttribute('src');
       audio.load();
     }
-    store.setIsPlaying(false);
-    store.clearQueue(); // also clears currentTrack, which hides the player
+    live().setIsPlaying(false);
+    live().clearQueue(); // also clears currentTrack, which hides the player
+    releaseWakeLock();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'none';
-  }, [store, reportProgress]);
+  }, [reportProgress, releaseWakeLock]);
 
   // Sleep timer effect
   useEffect(() => {
-    if (!store.sleepTimerEndsAt) return;
-    const remaining = store.sleepTimerEndsAt - Date.now();
+    if (!sleepTimerEndsAt) return;
+    const remaining = sleepTimerEndsAt - Date.now();
     if (remaining <= 0) {
       pause();
-      store.setSleepTimerEndsAt(null);
+      live().setSleepTimerEndsAt(null);
       return;
     }
     const timer = setTimeout(() => {
       pause();
-      store.setSleepTimerEndsAt(null);
+      live().setSleepTimerEndsAt(null);
     }, remaining);
     return () => clearTimeout(timer);
-  }, [store.sleepTimerEndsAt, pause]);
+  }, [sleepTimerEndsAt, pause]);
 
   return (
     <AudioPlayerContext.Provider
@@ -373,24 +529,39 @@ export function AudioPlayerProvider({ children }: { children: React.ReactNode })
     >
       {children}
 
-      {store.previewEnded && (
+      {previewEnded && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
           <div className="glass-card rounded-3xl p-8 max-w-sm text-center">
             <div className="w-14 h-14 mx-auto rounded-2xl bg-primary/15 text-primary flex items-center justify-center mb-4">
               <Lock className="w-7 h-7" />
             </div>
-            <h3 className="text-xl font-black text-foreground mb-2">1-minute preview</h3>
+            <h3 className="text-xl font-black text-foreground mb-2">Enjoying the preview?</h3>
             <p className="text-muted-foreground mb-6 text-sm">
-              You&apos;ve reached the free preview limit for this session. Full episodes are coming
-              soon.
+              Sign in or create a free account to listen to the full episode.
             </p>
-            <button
-              type="button"
-              onClick={() => store.setPreviewEnded(false)}
-              className="px-6 py-2.5 bg-primary text-white rounded-full font-semibold glow-primary"
-            >
-              Got it
-            </button>
+            <div className="flex flex-col gap-2">
+              <Link
+                href={`/auth/login?redirect=${encodeURIComponent(pathname || '/')}`}
+                onClick={() => live().setPreviewEnded(false)}
+                className="px-6 py-2.5 bg-primary text-white rounded-full font-semibold glow-primary"
+              >
+                Sign in
+              </Link>
+              <Link
+                href="/auth/register"
+                onClick={() => live().setPreviewEnded(false)}
+                className="px-6 py-2.5 glass-card rounded-full font-semibold"
+              >
+                Create a free account
+              </Link>
+              <button
+                type="button"
+                onClick={() => live().setPreviewEnded(false)}
+                className="px-6 py-2 text-sm text-muted-foreground hover:text-foreground"
+              >
+                Not now
+              </button>
+            </div>
           </div>
         </div>
       )}

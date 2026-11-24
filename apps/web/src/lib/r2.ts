@@ -87,35 +87,49 @@ export interface MultipartStart {
   partSize: number;
 }
 
+/**
+ * How long a part URL stays valid. A 3-hour WAV is ~2 GB, which on a slow
+ * uplink takes well over the hour these URLs used to last — parts queued
+ * behind the first hour then failed with 403 and the whole upload was thrown
+ * away. Each URL can only write its own part of this one upload, so a long
+ * window costs nothing; signPartUrl() covers anything that outlives it anyway.
+ */
+const PART_URL_TTL = 24 * 60 * 60;
+
+/** Most parts one upload may have — S3/R2's own limit. */
+export const MAX_PARTS = 10_000;
+
+function partUrl(uploadId: string, key: string, partNumber: number, expiresIn = PART_URL_TTL) {
+  return getSignedUrl(
+    r2(),
+    new UploadPartCommand({ Bucket: bucket(), Key: key, UploadId: uploadId, PartNumber: partNumber }),
+    { expiresIn },
+  );
+}
+
 export async function startMultipart(
   key: string,
   contentType: string,
   partCount: number,
-  expiresIn = 3600,
 ): Promise<MultipartStart> {
-  const client = r2();
-  const created = await client.send(
+  const created = await r2().send(
     new CreateMultipartUploadCommand({ Bucket: bucket(), Key: key, ContentType: contentType }),
   );
   const uploadId = created.UploadId;
   if (!uploadId) throw new Error('R2 did not return an upload id');
 
+  // Signing is local HMAC work, not a request to R2, so even a few hundred
+  // parts sign in milliseconds.
   const partUrls = await Promise.all(
-    Array.from({ length: partCount }, (_, i) =>
-      getSignedUrl(
-        client,
-        new UploadPartCommand({
-          Bucket: bucket(),
-          Key: key,
-          UploadId: uploadId,
-          PartNumber: i + 1,
-        }),
-        { expiresIn },
-      ),
-    ),
+    Array.from({ length: partCount }, (_, i) => partUrl(uploadId, key, i + 1)),
   );
 
   return { uploadId, partUrls, partSize: PART_SIZE };
+}
+
+/** A fresh URL for one part, for a retry after the original was refused. */
+export function signPartUrl(key: string, uploadId: string, partNumber: number): Promise<string> {
+  return partUrl(uploadId, key, partNumber);
 }
 
 /**

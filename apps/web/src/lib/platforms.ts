@@ -156,8 +156,12 @@ export function parsePlatformLinks(value: unknown): PlatformLinks {
  * `javascript:` URL and every visitor's platform button would run it.
  */
 export function sanitizePlatformUrl(input: string): string | null {
-  const value = input.trim();
+  let value = input.trim();
   if (!value) return null;
+  // "open.spotify.com/episode/…" pasted without its scheme used to be dropped
+  // silently. A bare host[/path] gets https:// — anything with a scheme of its
+  // own (javascript:, data:) still has to pass the protocol check below.
+  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+(?::\d+)?(?:[/?#]|$)/i.test(value)) value = `https://${value}`;
   try {
     const url = new URL(value);
     return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null;

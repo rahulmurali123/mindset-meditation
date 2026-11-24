@@ -61,9 +61,29 @@ function ResetPasswordForm() {
           type: 'recovery',
         });
         if (cancelled) return;
+        if (!otpError) {
+          markRecovery();
+          // The hash is single-use. Left in the address bar, a reload (iOS
+          // Safari does one when you switch to a password manager) re-ran
+          // verifyOtp on the spent hash and showed "expired" to someone who
+          // was in fact holding a valid recovery session.
+          window.history.replaceState(null, '', '/auth/reset-password');
+          setPhase('ready');
+          return;
+        }
+        // A reload in a tab that already verified this link.
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        if (cancelled) return;
+        if (session && recentRecovery()) {
+          window.history.replaceState(null, '', '/auth/reset-password');
+          setPhase('ready');
+          return;
+        }
         // Supabase says "expired" for a consumed token too, which is the right
         // thing to tell the user either way: request a fresh link.
-        setPhase(otpError ? (/expired|invalid/i.test(otpError.message) ? 'expired' : 'invalid') : 'ready');
+        setPhase(/expired|invalid/i.test(otpError.message) ? 'expired' : 'invalid');
         return;
       }
 
@@ -77,16 +97,20 @@ function ResetPasswordForm() {
           setPhase(/expired/i.test(exchangeError.message) ? 'expired' : 'invalid');
           return;
         }
+        markRecovery();
         setPhase('ready');
         return;
       }
 
-      // Implicit flow, or the user reloaded the page after the exchange: the
-      // client will already have a session either way.
+      // Implicit flow (tokens in the fragment, type=recovery), or a reload
+      // after this tab already verified a link. NOT any session at all: that
+      // let anyone at a signed-in browser open this page and set a new
+      // password without knowing the current one.
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!cancelled) setPhase(session ? 'ready' : 'invalid');
+      const fromRecoveryLink = hash.get('type') === 'recovery' || recentRecovery();
+      if (!cancelled) setPhase(session && fromRecoveryLink ? 'ready' : 'invalid');
     }
 
     establish();
@@ -131,6 +155,7 @@ function ResetPasswordForm() {
       return;
     }
 
+    clearRecovery();
     setPhase('done');
     toast.success('Password updated');
     // Signed out deliberately, so the new password is actually used to get back
@@ -160,7 +185,7 @@ function ResetPasswordForm() {
         </h3>
         <p className="text-sm text-muted-foreground leading-relaxed">
           {expired
-            ? 'Reset links are good for one hour and can only be used once. Request a fresh one and it will work straight away.'
+            ? 'Reset links are good for one hour and can only be used once — and only the most recent email works. Request a fresh one and it will work straight away.'
             : 'This link has already been used, or it was not a complete reset link. Request a new one to try again.'}
         </p>
         <Link
@@ -225,6 +250,39 @@ function ResetPasswordForm() {
       </form>
     </>
   );
+}
+
+/**
+ * Marks, for this tab only, that a recovery link was verified here — so a
+ * reload of this page can still show the form, but an ordinary signed-in
+ * session that never opened a link cannot.
+ */
+const RECOVERY_KEY = 'mm-recovery-verified-at';
+const RECOVERY_WINDOW_MS = 15 * 60 * 1000;
+
+function markRecovery() {
+  try {
+    sessionStorage.setItem(RECOVERY_KEY, String(Date.now()));
+  } catch {
+    /* storage blocked: a reload will just need a fresh link */
+  }
+}
+
+function recentRecovery(): boolean {
+  try {
+    const at = Number(sessionStorage.getItem(RECOVERY_KEY));
+    return Number.isFinite(at) && Date.now() - at < RECOVERY_WINDOW_MS;
+  } catch {
+    return false;
+  }
+}
+
+function clearRecovery() {
+  try {
+    sessionStorage.removeItem(RECOVERY_KEY);
+  } catch {
+    /* nothing to clear */
+  }
 }
 
 export default function ResetPasswordPage() {

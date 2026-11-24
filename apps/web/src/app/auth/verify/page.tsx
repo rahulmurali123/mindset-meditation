@@ -2,6 +2,7 @@
 
 import { Suspense, useState, type FormEvent } from 'react';
 import { useSearchParams } from 'next/navigation';
+import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { ShieldCheck, Loader2, KeyRound } from 'lucide-react';
 import { LogoMark } from '@/components/layout/logo';
@@ -102,6 +103,12 @@ function VerifyForm() {
         <code>.env</code>. It is checked on the server and never sent to the browser. Verification
         lasts 12 hours.
       </p>
+      <Link
+        href="/auth/login"
+        className="mt-4 inline-block text-sm text-muted-foreground hover:text-foreground transition-colors"
+      >
+        Signed out or wrong account? Sign in again
+      </Link>
     </motion.div>
   );
 }

@@ -10,20 +10,93 @@ import type { PodcastClient } from '@/lib/supabase/types';
 // Server Actions — run as the signed-in user; RLS enforces authorization.
 import { revalidatePath } from 'next/cache';
 import { checkAdmin } from '@/lib/admin-guard';
+import { rateLimit } from '@/lib/rate-limit';
+import { isUuid } from '@/lib/utils';
 
 /**
- * Keeps only known platform ids holding valid http(s) URLs. Without the
- * protocol check an admin could store a `javascript:` URL that then runs for
- * every visitor who clicks that platform button.
+ * Server actions are public HTTP endpoints: anything can POST any JSON at
+ * them, whatever the TypeScript signature says. These coerce instead of
+ * trusting — `.trim()` on a missing field used to throw an unhandled TypeError.
  */
-function cleanPlatformLinks(input: PlatformLinks | undefined): PlatformLinks {
-  const out: PlatformLinks = {};
-  if (!input) return out;
-  for (const { id } of PLATFORMS) {
-    const url = input[id] ? sanitizePlatformUrl(input[id] as string) : null;
-    if (url) out[id] = url;
+function str(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/** Audio keys minted by /api/admin/upload-url: "r2:podcasts/…" or "sb:podcasts/…". */
+const AUDIO_PATH_RE = /^(r2|sb):podcasts\/[\w.-]+$/;
+/** Cover keys minted by uploadCover(): "covers/…" or "playlists/…". */
+const COVER_PATH_RE = /^(covers|playlists)\/[\w.-]+$/;
+
+/**
+ * The public URL for an uploaded cover, rebuilt here from its storage key
+ * instead of trusting the URL the browser sent. The stored URL is rendered on
+ * every public page and in the RSS feed, so accepting it verbatim let any
+ * admin session (or a stolen one) point artwork at an arbitrary host.
+ */
+function coverFromPath(path: unknown): { url: string; path: string } | null {
+  if (typeof path !== 'string' || !COVER_PATH_RE.test(path)) return null;
+  const url = createAdminClient().storage.from(BUCKETS.thumbnails).getPublicUrl(path).data
+    .publicUrl;
+  return { url, path };
+}
+
+/** Only an inline image the cover canvas produced, and never a huge one. */
+function cleanBlurDataUrl(value: unknown): string | null {
+  return typeof value === 'string' &&
+    /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(value) &&
+    value.length <= 20_000
+    ? value
+    : null;
+}
+
+function cleanKeywords(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((k): k is string => typeof k === 'string')
+    .map((k) => k.trim().slice(0, 60))
+    .filter(Boolean)
+    // 25 is what buildKeywords() produces; a lower cap here trimmed every
+    // generated list that passed back through the edit form.
+    .slice(0, 25);
+}
+
+function cleanFileSize(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.round(value)
+    : null;
+}
+
+/**
+ * Keeps only known platform ids holding valid http(s) URLs — without the
+ * protocol check an admin could store a `javascript:` URL that then runs for
+ * every visitor who clicks that platform button — plus the names of links
+ * that were refused.
+ */
+function platformLinksWithRejects(input: PlatformLinks | undefined): {
+  links: PlatformLinks;
+  rejected: string[];
+} {
+  const links: PlatformLinks = {};
+  const rejected: string[] = [];
+  if (!input || typeof input !== 'object') return { links, rejected };
+  for (const { id, label } of PLATFORMS) {
+    const raw = input[id];
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const url = sanitizePlatformUrl(raw);
+    if (url) links[id] = url;
+    else rejected.push(label);
   }
-  return out;
+  return { links, rejected };
+}
+
+/**
+ * Text for links a save dropped, so "Saved" does not claim the listener will
+ * be sent somewhere they will not.
+ */
+function rejectedLinksWarning(rejected: string[]): string | undefined {
+  return rejected.length
+    ? `Not saved — not a valid web address: ${rejected.join(', ')} link. Paste the full https:// link.`
+    : undefined;
 }
 
 /**
@@ -99,6 +172,7 @@ async function insertWithUniqueSlug<T extends { id: string; slug: string }>(
  * Returns false for signed-out visitors, who have no library.
  */
 export async function isSaved(trackId: string): Promise<boolean> {
+  if (!isUuid(trackId)) return false;
   const supabase = await createClient();
   const {
     data: { user },
@@ -115,11 +189,15 @@ export async function isSaved(trackId: string): Promise<boolean> {
 }
 
 export async function toggleSave(trackId: string) {
+  if (!isUuid(trackId)) return { error: 'Episode not found' };
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: 'Please sign in' };
+  if (rateLimit('save', user.id, 60, 60_000).limited) {
+    return { error: 'Slow down a little and try again.' };
+  }
 
   const { data: existing } = await supabase
     .from('favorites')
@@ -129,37 +207,61 @@ export async function toggleSave(trackId: string) {
     .maybeSingle();
 
   if (existing) {
-    await supabase.from('favorites').delete().eq('id', existing.id);
+    const { error } = await supabase.from('favorites').delete().eq('id', existing.id);
+    if (error) return { error: 'Could not update your library. Try again.' };
     return { saved: false };
   }
   const { error } = await supabase
     .from('favorites')
     .insert({ track_id: trackId, user_id: user.id });
-  if (error) return { error: error.message };
+  // 23505: a double-click raced the first insert — it is saved either way.
+  if (error && error.code !== '23505') {
+    return { error: 'Could not save that episode. Try again.' };
+  }
   return { saved: true };
 }
 
 export async function addComment(trackId: string, body: string, parentId?: string | null) {
+  if (!isUuid(trackId)) return { error: 'Episode not found' };
+  if (parentId != null && !isUuid(parentId)) return { error: 'That comment no longer exists' };
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: 'Please sign in' };
 
-  const text = body.trim();
+  const text = str(body);
   if (!text) return { error: 'Comment is empty' };
   if (text.length > 2000) return { error: 'Comment is too long' };
+
+  // Any signed-up account can post, and sign-up is instant, so a flood is one
+  // script away. Generous enough that no real listener will ever see it.
+  if (
+    rateLimit('comment', user.id, 5, 60_000).limited ||
+    rateLimit('comment-day', user.id, 100, 24 * 60 * 60_000).limited
+  ) {
+    return { error: 'You are commenting very quickly — please wait a minute.' };
+  }
 
   const { data, error } = await supabase
     .from('comments')
     .insert({ track_id: trackId, user_id: user.id, body: text, parent_id: parentId ?? null })
     .select('id, body, created_at, user_id, parent_id')
     .single();
-  if (error) return { error: error.message };
+  if (error) {
+    // The database enforces the same limit (migration 039), across instances.
+    if (error.message.includes('comment_rate_limited')) {
+      return { error: 'You are commenting very quickly — please wait a minute.' };
+    }
+    console.error('[comments] insert failed:', error.code, error.message);
+    // RLS refuses comments on drafts and the parent trigger refuses bad threads;
+    // neither message is meant for a listener.
+    return { error: 'Could not post that comment. Reload the page and try again.' };
+  }
 
   const { data: profile } = await supabase
     .from('profiles')
-    .select('full_name, username, email')
+    .select('full_name, username')
     .eq('id', user.id)
     .maybeSingle();
 
@@ -169,7 +271,7 @@ export async function addComment(trackId: string, body: string, parentId?: strin
   return {
     comment: {
       ...data,
-      author: profile?.full_name || profile?.username || profile?.email?.split('@')[0] || 'You',
+      author: profile?.full_name || profile?.username || 'You',
       mine: true,
       isAdmin: role === 'admin' || role === 'super_admin',
     },
@@ -177,6 +279,7 @@ export async function addComment(trackId: string, body: string, parentId?: strin
 }
 
 export async function deleteComment(id: string) {
+  if (!isUuid(id)) return { error: 'Comment not found' };
   const supabase = await createClient();
   // RLS (comments_delete_own) already restricts this to the author or an
   // admin — a mismatched id just deletes zero rows, no error. This explicit
@@ -199,8 +302,15 @@ export async function deleteComment(id: string) {
     if (!gate.ok) return { error: 'Not authorized to delete this comment' };
   }
 
-  const { error } = await supabase.from('comments').delete().eq('id', id);
-  return error ? { error: error.message } : { ok: true };
+  const { data: removed, error } = await supabase
+    .from('comments')
+    .delete()
+    .eq('id', id)
+    .select('id');
+  if (error) return { error: 'Could not delete that comment. Try again.' };
+  // RLS turns a refused delete into zero rows rather than an error.
+  if (!removed?.length) return { error: 'Not authorized to delete this comment' };
+  return { ok: true };
 }
 
 // ---- Admin ----
@@ -256,6 +366,10 @@ function revalidateDiscovery() {
 function revalidateEpisode(slug?: string | null, playlistSlugs: string[] = []) {
   revalidatePath('/');
   revalidatePath('/episodes');
+  // Playlist cards show episode counts and running time, which only count
+  // published episodes (migration 038) — so publishing, unpublishing or
+  // deleting one changes them too.
+  revalidatePath('/playlists');
   revalidatePath('/admin/playlists');
   if (slug) revalidatePath(`/podcast/${slug}`);
   for (const playlistSlug of new Set(playlistSlugs)) {
@@ -301,10 +415,11 @@ function revalidatePlaylist(slug?: string | null) {
  * to import it — so "this action is only referenced from /admin" is not an
  * access control. Row-level security covers the `tracks` writes (see
  * `tracks_insert_admin` / `tracks_update_admin` / `tracks_delete_admin` in
- * fullschema.sql), but it does NOT cover playlists: `playlists_insert_own` only
- * requires `user_id = auth.uid()`, so before this guard any signed-in listener
- * could invoke `adminCreatePlaylist` and publish a public playlist onto the
- * homepage, /playlists and the sitemap.
+ * fullschema.sql) and, since migration 037, the playlist writes too — before
+ * that, `playlists_insert_own` let any signed-in listener publish a public
+ * playlist. This guard is the app-side half; neither layer relies on the other.
+ * It is also the only thing enforcing the verification-code second factor,
+ * which the database knows nothing about.
  *
  * Returns an error string to hand straight back to the caller, or the caller's
  * id when they are a verified admin. `checkAdmin` is React-cached, so an action
@@ -337,9 +452,12 @@ export async function adminCreatePlaylist(input: PlaylistInput) {
   if (gate.error) return { error: gate.error };
   const supabase = await createClient();
 
-  const title = input.title.trim();
+  const title = str(input?.title);
   if (!title) return { error: 'Playlist name is required' };
   if (title.length > 200) return { error: 'Playlist name is too long' };
+  const description = str(input.description);
+  if (description.length > 1000) return { error: 'Description must be at most 1000 characters' };
+  const cover = input.coverUrl ? coverFromPath(input.coverPath) : null;
 
   const { data: existing } = await supabase
     .from('playlists')
@@ -356,10 +474,10 @@ export async function adminCreatePlaylist(input: PlaylistInput) {
     {
       user_id: gate.userId,
       title,
-      description: input.description?.trim() || null,
-      thumbnail_url: input.coverUrl || null,
-      thumbnail_path: input.coverPath || null,
-      is_public: input.isPublic ?? true,
+      description: description || null,
+      thumbnail_url: cover?.url ?? null,
+      thumbnail_path: cover?.path ?? null,
+      is_public: typeof input.isPublic === 'boolean' ? input.isPublic : true,
     },
     'id, title, slug',
   );
@@ -375,21 +493,32 @@ export async function adminUpdatePlaylist(input: PlaylistInput & { id: string })
   if (gate.error) return { error: gate.error };
   const supabase = await createClient();
 
-  const title = input.title.trim();
+  if (!isUuid(input?.id)) return { error: 'Playlist not found' };
+  const title = str(input.title);
   if (!title) return { error: 'Playlist name is required' };
   if (title.length > 200) return { error: 'Playlist name is too long' };
+  const description = str(input.description);
+  if (description.length > 1000) return { error: 'Description must be at most 1000 characters' };
 
   // biome-ignore lint/suspicious/noExplicitAny: partial update over an untyped row
   const patch: Record<string, any> = {
     title,
-    description: input.description?.trim() || null,
+    description: description || null,
   };
-  if (input.isPublic !== undefined) patch.is_public = input.isPublic;
+  if (typeof input.isPublic === 'boolean') patch.is_public = input.isPublic;
   // Only replace the artwork when a new file was actually uploaded — otherwise
   // saving the title would silently wipe the existing cover.
-  if (input.coverUrl) {
-    patch.thumbnail_url = input.coverUrl;
-    patch.thumbnail_path = input.coverPath ?? null;
+  const cover = input.coverUrl ? coverFromPath(input.coverPath) : null;
+  let previousCover: string | null = null;
+  if (cover) {
+    patch.thumbnail_url = cover.url;
+    patch.thumbnail_path = cover.path;
+    const { data: before } = await supabase
+      .from('playlists')
+      .select('thumbnail_path')
+      .eq('id', input.id)
+      .maybeSingle();
+    previousCover = (before as { thumbnail_path: string | null } | null)?.thumbnail_path ?? null;
   }
 
   const { data, error } = await supabase
@@ -400,14 +529,26 @@ export async function adminUpdatePlaylist(input: PlaylistInput & { id: string })
     .single();
 
   if (error) return { error: schemaHint(error.message) };
+
+  // The replaced artwork belongs to nothing now — every cover swap used to
+  // leave the old image in the public bucket for good. Only after the update
+  // succeeded, so a failed save keeps its cover.
+  const leftovers =
+    previousCover && previousCover !== cover?.path
+      ? await removeStoredFiles(null, previousCover)
+      : [];
+
   revalidatePlaylist(data.slug);
-  return { playlist: data };
+  return leftovers.length
+    ? { playlist: data, warning: `Saved, but could not remove the old ${leftovers.join(' and ')}.` }
+    : { playlist: data };
 }
 
 /** Soft delete, matching adminDeletePodcast — the episodes inside are kept. */
 export async function adminDeletePlaylist(id: string) {
   const gate = await requireAdmin();
   if (gate.error) return { error: gate.error };
+  if (!isUuid(id)) return { error: 'Playlist not found' };
   const supabase = await createClient();
 
   // Read the slug BEFORE the delete. Reading it back afterwards cannot work:
@@ -475,6 +616,8 @@ export async function adminDiscardUpload(input: {
       ? input.audioPath
       : null;
   const coverPath =
+    // covers/ only: playlist artwork is referenced by playlists, which the
+    // in-use check below does not look at.
     typeof input?.coverPath === 'string' && /^covers\/[\w.-]+$/.test(input.coverPath)
       ? input.coverPath
       : null;
@@ -530,20 +673,37 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
   if (gate.error) return { error: gate.error };
   const supabase = await createClient();
 
-  const title = input.title.trim();
+  const title = str(input?.title);
   if (!title) return { error: 'Title is required' };
   if (title.length > TRACK_LIMITS.title) {
     return { error: `Title must be at most ${TRACK_LIMITS.title} characters` };
   }
-  if ((input.description?.trim().length ?? 0) > TRACK_LIMITS.description) {
+  if (str(input.description).length > TRACK_LIMITS.description) {
     return { error: `Description must be at most ${TRACK_LIMITS.description} characters` };
   }
-  if (!input.audioPath) return { error: 'Audio file is required' };
+  // Only a key /api/admin/upload-url minted: anything else would make the
+  // stream route sign a URL for an arbitrary object in the bucket.
+  if (typeof input.audioPath !== 'string' || !AUDIO_PATH_RE.test(input.audioPath)) {
+    return { error: 'Audio file is required' };
+  }
+  if (input.playlistId != null && input.playlistId !== '' && !isUuid(input.playlistId)) {
+    return { error: 'That playlist no longer exists' };
+  }
   // A 0 here would be clamped to 1 second and silently ship a broken episode;
   // the form blocks submission, and this is the server-side backstop.
-  if (!input.durationSeconds || input.durationSeconds < 1) {
+  if (
+    typeof input.durationSeconds !== 'number' ||
+    !Number.isFinite(input.durationSeconds) ||
+    input.durationSeconds < 1 ||
+    input.durationSeconds > 24 * 60 * 60
+  ) {
     return { error: 'Could not read the audio duration — re-select the file and try again' };
   }
+  const cover = input.coverUrl ? coverFromPath(input.coverPath) : null;
+  const fileSizeBytes = cleanFileSize(input.fileSizeBytes);
+  const keywords = cleanKeywords(input.keywords);
+  const platformLinks = platformLinksWithRejects(input.platformLinks);
+  const linkWarning = rejectedLinksWarning(platformLinks.rejected);
 
   // The playlist title feeds the generated copy, so fetch it before generating.
   let playlistTitle: string | null = null;
@@ -560,7 +720,7 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
   const playlistSlugs = playlistSlug ? [playlistSlug] : [];
 
   const durationSeconds = Math.round(input.durationSeconds);
-  const description = input.description?.trim() || null;
+  const description = str(input.description) || null;
   const generated = generateEpisodeMetadata({
     title,
     playlistTitle,
@@ -575,22 +735,20 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
     // now a sentence-boundary excerpt rather than a mid-word .slice(0, 300).
     short_description: generated.excerpt.slice(0, 300),
     excerpt: generated.excerpt,
-    meta_description: clampMeta(input.metaDescription?.trim() || generated.metaDescription),
-    keywords: input.keywords?.length ? input.keywords : generated.keywords,
+    meta_description: clampMeta(str(input.metaDescription) || generated.metaDescription),
+    keywords: keywords.length ? keywords : generated.keywords,
     duration_seconds: durationSeconds,
     audio_url: input.audioPath,
     audio_path: input.audioPath,
-    thumbnail_url: input.coverUrl || null,
-    thumbnail_path: input.coverPath || null,
-    blur_data_url: input.blurDataUrl || null,
-    file_size_bytes: input.fileSizeBytes ?? null,
-    bitrate_kbps: input.fileSizeBytes
-      ? Math.round((input.fileSizeBytes * 8) / durationSeconds / 1000)
-      : null,
-    instructor_name: input.channel?.trim() || null,
-    platform_links: cleanPlatformLinks(input.platformLinks),
-    status: input.publish ? 'published' : 'draft',
-    published_at: input.publish ? new Date().toISOString() : null,
+    thumbnail_url: cover?.url ?? null,
+    thumbnail_path: cover?.path ?? null,
+    blur_data_url: cover ? cleanBlurDataUrl(input.blurDataUrl) : null,
+    file_size_bytes: fileSizeBytes,
+    bitrate_kbps: fileSizeBytes ? Math.round((fileSizeBytes * 8) / durationSeconds / 1000) : null,
+    instructor_name: str(input.channel).slice(0, 200) || null,
+    platform_links: platformLinks.links,
+    status: input.publish === true ? 'published' : 'draft',
+    published_at: input.publish === true ? new Date().toISOString() : null,
   };
 
   const { data, error } = await insertWithUniqueSlug(supabase, 'tracks', title, row);
@@ -622,7 +780,7 @@ export async function adminCreatePodcast(input: CreatePodcastInput) {
   }
 
   revalidateEpisode(data.slug, playlistSlugs);
-  return { podcast: data };
+  return linkWarning ? { podcast: data, warning: linkWarning } : { podcast: data };
 }
 
 interface UpdatePodcastInput {
@@ -652,14 +810,33 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
   if (gate.error) return { error: gate.error };
   const supabase = await createClient();
 
-  const title = input.title.trim();
+  if (!isUuid(input?.id)) return { error: 'Episode not found' };
+  const title = str(input.title);
   if (!title) return { error: 'Title is required' };
   if (title.length > TRACK_LIMITS.title) {
     return { error: `Title must be at most ${TRACK_LIMITS.title} characters` };
   }
-  if ((input.description?.trim().length ?? 0) > TRACK_LIMITS.description) {
+  if (str(input.description).length > TRACK_LIMITS.description) {
     return { error: `Description must be at most ${TRACK_LIMITS.description} characters` };
   }
+  if (input.audioPath != null && input.audioPath !== '') {
+    if (typeof input.audioPath !== 'string' || !AUDIO_PATH_RE.test(input.audioPath)) {
+      return { error: 'That audio upload is not valid — re-select the file and try again' };
+    }
+  }
+  if (input.playlistId != null && input.playlistId !== '' && !isUuid(input.playlistId)) {
+    return { error: 'That playlist no longer exists' };
+  }
+  const cover = input.coverUrl ? coverFromPath(input.coverPath) : null;
+  const keywords = cleanKeywords(input.keywords);
+  const newDuration =
+    typeof input.durationSeconds === 'number' &&
+    Number.isFinite(input.durationSeconds) &&
+    input.durationSeconds > 0 &&
+    input.durationSeconds <= 24 * 60 * 60
+      ? input.durationSeconds
+      : null;
+  const fileSizeBytes = cleanFileSize(input.fileSizeBytes);
 
   // The generated copy is derived from title + playlist + duration, so it has
   // to be recomputed on edit or an episode keeps the description of its old
@@ -692,12 +869,13 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
     playlistTitle = pl?.title ?? null;
   }
 
-  const durationSeconds =
-    input.durationSeconds && input.durationSeconds > 0
-      ? Math.round(input.durationSeconds)
-      : (existingTrack?.duration_seconds ?? 1);
+  if (!existingTrack) return { error: 'Episode not found' };
 
-  const description = input.description?.trim() || null;
+  const durationSeconds = newDuration
+    ? Math.round(newDuration)
+    : (existingTrack.duration_seconds ?? 1);
+
+  const description = str(input.description) || null;
   const generated = generateEpisodeMetadata({
     title,
     playlistTitle,
@@ -711,9 +889,9 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
     description,
     short_description: generated.excerpt.slice(0, 300),
     excerpt: generated.excerpt,
-    meta_description: clampMeta(input.metaDescription?.trim() || generated.metaDescription),
-    keywords: input.keywords?.length ? input.keywords : generated.keywords,
-    instructor_name: input.channel?.trim() || null,
+    meta_description: clampMeta(str(input.metaDescription) || generated.metaDescription),
+    keywords: keywords.length ? keywords : generated.keywords,
+    instructor_name: str(input.channel).slice(0, 200) || null,
   };
 
   // NB: `slug` is intentionally absent. Renaming an episode must not change its
@@ -724,23 +902,24 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
   if (input.audioPath) {
     patch.audio_path = input.audioPath;
     patch.audio_url = input.audioPath;
-    if (input.durationSeconds && input.durationSeconds > 0) {
-      patch.duration_seconds = Math.round(input.durationSeconds);
-      if (input.fileSizeBytes) {
-        patch.file_size_bytes = input.fileSizeBytes;
-        patch.bitrate_kbps = Math.round(
-          (input.fileSizeBytes * 8) / Math.round(input.durationSeconds) / 1000,
-        );
+    if (newDuration) {
+      patch.duration_seconds = Math.round(newDuration);
+      if (fileSizeBytes) {
+        patch.file_size_bytes = fileSizeBytes;
+        patch.bitrate_kbps = Math.round((fileSizeBytes * 8) / Math.round(newDuration) / 1000);
       }
     }
   }
-  if (input.coverUrl) {
-    patch.thumbnail_url = input.coverUrl;
-    patch.thumbnail_path = input.coverPath ?? null;
-    patch.blur_data_url = input.blurDataUrl ?? null;
+  if (cover) {
+    patch.thumbnail_url = cover.url;
+    patch.thumbnail_path = cover.path;
+    patch.blur_data_url = cleanBlurDataUrl(input.blurDataUrl);
   }
+  let updateLinkWarning: string | undefined;
   if (input.platformLinks) {
-    patch.platform_links = cleanPlatformLinks(input.platformLinks);
+    const cleaned = platformLinksWithRejects(input.platformLinks);
+    patch.platform_links = cleaned.links;
+    updateLinkWarning = rejectedLinksWarning(cleaned.rejected);
   }
 
   const { data, error } = await supabase
@@ -794,9 +973,7 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
       ? existingTrack?.audio_path
       : null;
   const replacedCover =
-    input.coverUrl && existingTrack?.thumbnail_path !== (input.coverPath ?? null)
-      ? existingTrack?.thumbnail_path
-      : null;
+    cover && existingTrack?.thumbnail_path !== cover.path ? existingTrack?.thumbnail_path : null;
   const leftovers = await removeStoredFiles(replacedAudio, replacedCover);
 
   revalidatePath('/playlists');
@@ -804,14 +981,22 @@ export async function adminUpdatePodcast(input: UpdatePodcastInput) {
     ...previousPlaylistSlugs,
     ...(await playlistSlugsForTrack(supabase, input.id)),
   ]);
-  return leftovers.length > 0
-    ? { podcast: data, warning: `Saved, but could not remove the old ${leftovers.join(' and ')}.` }
-    : { podcast: data };
+  const warnings = [
+    updateLinkWarning,
+    leftovers.length > 0
+      ? `Saved, but could not remove the old ${leftovers.join(' and ')}.`
+      : undefined,
+  ].filter(Boolean);
+  return warnings.length ? { podcast: data, warning: warnings.join(' ') } : { podcast: data };
 }
 
 export async function adminSetStatus(id: string, status: 'draft' | 'published' | 'archived') {
   const gate = await requireAdmin();
   if (gate.error) return { error: gate.error };
+  if (!isUuid(id)) return { error: 'Episode not found' };
+  if (status !== 'draft' && status !== 'published' && status !== 'archived') {
+    return { error: 'Unknown status' };
+  }
   const supabase = await createClient();
 
   // The slug comes back on the same read as published_at — un-publishing has to
@@ -835,9 +1020,10 @@ export async function adminSetStatus(id: string, status: 'draft' | 'published' |
 
   const playlistSlugs = await playlistSlugsForTrack(supabase, id);
 
+  if (!existing) return { error: 'Episode not found' };
   const { error } = await supabase.from('tracks').update(patch).eq('id', id);
   if (error) return { error: error.message };
-  revalidateEpisode(existing?.slug, playlistSlugs);
+  revalidateEpisode(existing.slug, playlistSlugs);
   return { ok: true };
 }
 
@@ -860,6 +1046,7 @@ export async function adminSetStatus(id: string, status: 'draft' | 'published' |
 export async function adminDeletePodcast(id: string) {
   const gate = await requireAdmin();
   if (gate.error) return { error: gate.error };
+  if (!isUuid(id)) return { error: 'Episode not found' };
   const supabase = await createClient();
 
   // Read the paths BEFORE the delete — afterwards the row is gone and with it

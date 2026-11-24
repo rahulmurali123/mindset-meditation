@@ -3,6 +3,7 @@ import { Mail, Instagram, Youtube, Twitter } from 'lucide-react';
 import { Logo } from '@/components/layout/logo';
 import { PlatformButtons } from '@/components/podcast/platform-buttons';
 import { ContactForm } from '@/components/layout/contact-form';
+import { FooterAccountLinks } from '@/components/layout/footer-account-links';
 import { BRAND } from '@/lib/brand';
 import { HARDCODED_PLATFORMS } from '@/lib/platforms';
 
@@ -22,11 +23,6 @@ const SOCIALS = [
   { href: BRAND.social.youtube, label: 'YouTube', Icon: Youtube },
   { href: BRAND.social.x, label: 'X', Icon: Twitter },
 ].filter((s) => Boolean(s.href));
-
-const ACCOUNT_LINKS: Array<{ href: string; label: string }> = [
-  { href: '/auth/login', label: 'Sign in' },
-  { href: '/auth/register', label: 'Create account' },
-];
 
 export async function Footer() {
   const year = new Date().getFullYear();
@@ -91,18 +87,7 @@ export async function Footer() {
             <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-foreground mt-6 mb-4">
               Account
             </h3>
-            <ul className="space-y-2.5">
-              {ACCOUNT_LINKS.map((l) => (
-                <li key={l.href}>
-                  <Link
-                    href={l.href}
-                    className="text-sm text-foreground/60 hover:text-primary transition-colors duration-300"
-                  >
-                    {l.label}
-                  </Link>
-                </li>
-              ))}
-            </ul>
+            <FooterAccountLinks />
           </div>
 
           {/* Contact details (hidden on mobile/tablet) */}

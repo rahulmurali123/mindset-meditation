@@ -112,6 +112,12 @@ reports *"Network error during upload — check the storage bucket CORS
 settings"*, and the console shows the preflight failing with *No
 'Access-Control-Allow-Origin' header is present*.
 
+**4b. Clean up abandoned uploads (recommended)**
+Long episodes upload in 8 MB parts. If the admin closes the tab mid-upload the
+parts stay in R2 (and billed) until the upload is aborted. Bucket → **Settings**
+→ **Object lifecycle rules** → add a rule that aborts incomplete multipart
+uploads after 2 days.
+
 **5. Fill in `.env` and restart**
 
 ```bash
@@ -359,8 +365,12 @@ SUPABASE_DB_URL=postgresql://postgres.<project-ref>:<password>@aws-0-<region>.po
    in constant time and never sent to the browser. Proof is kept in a signed,
    HttpOnly cookie bound to that user id, valid 12 hours.
 
-Changing the code immediately invalidates every admin session. There is no
-password-only path to `/admin`: with the code unset, admin access fails closed.
+Changing the code does **not** by itself end sessions that already passed it.
+If the code leaks, change it, restart, and then run
+`DELETE FROM podcast.admin_sessions;` in the SQL editor — that revokes every
+verified admin session at once (app and database), and each admin is asked for
+the new code. There is no password-only path to `/admin`: with the code unset,
+admin access fails closed.
 
 ### Roles
 

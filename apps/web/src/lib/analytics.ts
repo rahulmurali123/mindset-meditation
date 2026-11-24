@@ -7,6 +7,8 @@
 // below it, so everything numeric is typed `number | string` and passed through
 // `num()` before use rather than trusted to arrive as one or the other.
 
+import { SITE_TIME_ZONE } from '@/lib/utils';
+
 export interface DashboardStats {
   days: number;
   plays: number;
@@ -185,11 +187,14 @@ const dayFormatter = new Intl.DateTimeFormat('en-US', {
   timeZone: 'UTC',
 });
 
+// Day buckets from SQL are plain DATEs ("2026-11-24"), which parse as UTC
+// midnight — so dayFormatter stays on UTC to print the same date back. Real
+// timestamps (last played) are shown in the site's timezone instead.
 const dayWithYearFormatter = new Intl.DateTimeFormat('en-US', {
   month: 'short',
   day: 'numeric',
   year: 'numeric',
-  timeZone: 'UTC',
+  timeZone: SITE_TIME_ZONE,
 });
 
 /** "Aug 10" — axis ticks and compact labels. */

@@ -23,9 +23,18 @@ export type CookieOptions =
   | (Record<string, unknown> & { maxAge?: number; expires?: Date | number })
   | undefined;
 
-/** Drops `maxAge`/`expires` when the marker cookie is present. */
+/**
+ * Drops `maxAge`/`expires` when the marker cookie is present — except on a
+ * removal (maxAge 0, or an expiry in the past), which must keep its lifetime
+ * to delete anything. Stripping it turned a server-side sign-out or failed
+ * refresh into an empty session cookie that lingered until the browser closed.
+ */
 export function applySessionOnly(options: CookieOptions, sessionOnly: boolean): CookieOptions {
   if (!sessionOnly || !options) return options;
+  const expires = options.expires instanceof Date ? options.expires.getTime() : options.expires;
+  if (options.maxAge === 0 || (typeof expires === 'number' && expires <= Date.now())) {
+    return options;
+  }
   const { maxAge: _maxAge, expires: _expires, ...rest } = options;
   return rest;
 }

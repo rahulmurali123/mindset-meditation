@@ -1,12 +1,14 @@
-import { ADMIN_DENIAL_RESPONSE, checkAdmin } from '@/lib/admin-guard';
+import { ADMIN_DENIAL_RESPONSE, checkAdmin, renewAdminVerification } from '@/lib/admin-guard';
 import { AUDIO_BUCKET, audioBackend, encodeAudioPath } from '@/lib/audio-storage';
-import { MAX_AUDIO_BYTES } from '@/lib/podcast';
+import { MAX_AUDIO_BYTES, MAX_SUPABASE_AUDIO_BYTES, formatBytes } from '@/lib/podcast';
 import {
+  MAX_PARTS,
   MULTIPART_THRESHOLD,
   PART_SIZE,
   abortMultipart,
   completeMultipart,
   presignPutUrl,
+  signPartUrl,
   startMultipart,
 } from '@/lib/r2';
 // Tells the admin's browser where to put an audio file and how.
@@ -25,7 +27,8 @@ function newKey(filename: unknown): string {
       .split('.')
       .pop()
       ?.toLowerCase()
-      .replace(/[^a-z0-9]/g, '') || 'mp3';
+      .replace(/[^a-z0-9]/g, '')
+      .slice(0, 8) || 'mp3';
   return `podcasts/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
 }
 
@@ -58,13 +61,13 @@ export async function POST(req: NextRequest) {
   }
 
   const body = await req.json().catch(() => null);
-  if (!body) return fail('Malformed request', 400);
+  if (!body || typeof body !== 'object') return fail('Malformed request', 400);
 
   const action: string = body.action ?? 'start';
   const backend = audioBackend();
 
-  // ---- finish or clean up an in-flight multipart upload ----
-  if (action === 'complete' || action === 'abort') {
+  // ---- finish, re-sign or clean up an in-flight multipart upload ----
+  if (action === 'complete' || action === 'abort' || action === 'sign-part') {
     const { key, uploadId } = body;
     if (typeof key !== 'string' || typeof uploadId !== 'string') {
       return fail('key and uploadId are required', 400);
@@ -72,11 +75,19 @@ export async function POST(req: NextRequest) {
     // Keys are minted by this route and always live under podcasts/. Without
     // this an admin-authenticated caller could complete or abort an upload
     // anywhere in the bucket.
-    if (!key.startsWith('podcasts/') || key.includes('..')) {
+    if (!/^podcasts\/[\w.-]+$/.test(key) || key.includes('..') || uploadId.length > 1024) {
       return fail('Invalid key', 400);
     }
 
     try {
+      if (action === 'sign-part') {
+        // A retry after a part URL was refused or expired mid-upload.
+        const partNumber = Number(body.partNumber);
+        if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > MAX_PARTS) {
+          return fail('Invalid part number', 400);
+        }
+        return NextResponse.json({ url: await signPartUrl(key, uploadId, partNumber) });
+      }
       if (action === 'abort') {
         await abortMultipart(key, uploadId);
         return NextResponse.json({ ok: true });
@@ -100,13 +111,21 @@ export async function POST(req: NextRequest) {
 
   // ---- start a new upload ----
   const key = newKey(body.filename);
-  const contentType: string = body.contentType || 'audio/mpeg';
+  // A string of a sane shape: it is signed into the presigned URL and sent to
+  // R2 as the object's Content-Type, so a non-string here 500'd the route.
+  const contentType =
+    typeof body.contentType === 'string' && /^[\w.+-]+\/[\w.+-]+$/.test(body.contentType)
+      ? body.contentType.toLowerCase()
+      : 'audio/mpeg';
   const size = Number(body.size) || 0;
 
   // Refused before a single byte moves, rather than after the whole transfer.
-  if (size > MAX_AUDIO_BYTES) {
+  const limit = backend === 'r2' ? MAX_AUDIO_BYTES : MAX_SUPABASE_AUDIO_BYTES;
+  if (size > limit) {
     return fail(
-      `That file is ${Math.round(size / 1024 / 1024)} MB — the limit is ${MAX_AUDIO_BYTES / 1024 / 1024} MB.`,
+      backend === 'r2'
+        ? `That file is ${formatBytes(size)} — the limit is ${formatBytes(limit)}.`
+        : `That file is ${formatBytes(size)}. This server stores audio in Supabase Storage, which takes up to ${formatBytes(limit)} — configure Cloudflare R2 for longer episodes, or export at a lower bitrate.`,
       413,
     );
   }
@@ -115,6 +134,11 @@ export async function POST(req: NextRequest) {
   if (!contentType.startsWith('audio/') && !AUDIO_CONTAINER_TYPES.has(contentType)) {
     return fail('That file is not audio.', 415);
   }
+
+  // The upload and the save after it are admin-gated at every step, so an
+  // admin whose verification is close to lapsing gets it extended now rather
+  // than refused after the last byte of a long episode.
+  await renewAdminVerification(admin.userId as string).catch(() => {});
 
   if (backend !== 'r2') {
     if (!SUPABASE_AUDIO_TYPES.has(contentType)) {

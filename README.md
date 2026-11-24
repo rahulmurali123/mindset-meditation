@@ -114,7 +114,8 @@ Signing in to `/admin` takes two steps:
 
 The code is compared on the server and never sent to the browser. Proof is kept
 in a signed, HttpOnly cookie for 12 hours; five wrong attempts locks the account
-for 15 minutes. Changing the code signs every admin out.
+for 15 minutes. Changing the code does not end existing verifications; to
+revoke them all, also run `DELETE FROM podcast.admin_sessions;`.
 
 Roles cannot be changed from inside the app — `profiles.role` is not writable by
 the API roles, so a signed-in user cannot promote themselves. Grant admin with

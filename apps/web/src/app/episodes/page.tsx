@@ -21,6 +21,7 @@ import { AudioPlayer } from '@/components/player/audio-player-lazy';
 import { PodcastCard } from '@/components/podcast/podcast-card';
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/reveal';
 import { createPublicClient } from '@/lib/supabase/public';
+import { throwIfUnavailable } from '@/lib/supabase/errors';
 import { PODCAST_SELECT, type EpisodeSummary } from '@/lib/podcast';
 import { JsonLd, pageMetadata, itemListLd, breadcrumbLd } from '@/lib/seo';
 
@@ -43,13 +44,14 @@ export const revalidate = 300;
 export default async function EpisodesPage() {
   const supabase = createPublicClient();
 
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('tracks')
     .select(PODCAST_SELECT)
     .eq('status', 'published')
     .is('deleted_at', null)
     .order('published_at', { ascending: false, nullsFirst: false })
     .limit(200);
+  throwIfUnavailable('episodes', error);
 
   const episodes = (data ?? []) as EpisodeSummary[];
 

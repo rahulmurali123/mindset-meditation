@@ -10,14 +10,24 @@ import { num, share, type ReachEntry } from '@/lib/analytics';
 export function Breakdown({
   title,
   entries,
+  total: windowTotal = 0,
   emptyLabel = 'Nothing recorded yet.',
 }: {
   title: string;
   entries: ReachEntry[] | undefined;
+  /**
+   * Every play in the window. Only the top 8 values per dimension come back,
+   * so summing the rows overstated each share once a dimension had more
+   * (browsers, languages, referrers).
+   */
+  total?: number;
   emptyLabel?: string;
 }) {
   const rows = entries ?? [];
-  const total = rows.reduce((sum, e) => sum + num(e.plays), 0);
+  const total = Math.max(
+    windowTotal,
+    rows.reduce((sum, e) => sum + num(e.plays), 0),
+  );
 
   return (
     <div className="glass-card rounded-[2rem] p-5 border border-border">

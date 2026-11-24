@@ -12,7 +12,7 @@ import { useAudioPlayer } from '@/components/providers/audio-player-provider';
 import { usePlayerStore } from '@/store/player.store';
 import { formatDuration } from '@/lib/podcast';
 import { FALLBACK_COVER_GRADIENT } from '@/lib/fallback-cover';
-import { cn } from '@/lib/utils';
+import { cn, formatSiteDate } from '@/lib/utils';
 import type { Track } from '@mindset/types';
 
 export interface EpisodeItem {
@@ -27,15 +27,10 @@ export interface EpisodeItem {
   created_at?: string | null;
 }
 
-// Fixed month names, so the date renders identically on server and client
-// regardless of locale (toLocaleDateString can differ and trip hydration).
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
+// Pinned locale and timezone, so the date renders identically on server and
+// client (toLocaleDateString can differ and trip hydration).
 function formatDate(iso?: string | null): string | null {
-  if (!iso) return null;
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return null;
-  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
+  return formatSiteDate(iso) || null;
 }
 
 function NowPlayingWave() {
@@ -55,7 +50,7 @@ export function EpisodeRow({
   podcast: EpisodeItem;
   queue?: EpisodeItem[];
 }) {
-  const { play } = useAudioPlayer();
+  const { play, pause, resume } = useAudioPlayer();
   const currentId = usePlayerStore((s) => s.currentTrack?.id);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const isActive = currentId === podcast.id;
@@ -63,8 +58,12 @@ export function EpisodeRow({
   const desc = podcast.short_description || podcast.description;
   const date = formatDate(podcast.created_at);
 
-  const onPlay = () =>
-    play(podcast as unknown as Track, (queue ?? [podcast]) as unknown as Track[]);
+  // The active episode toggles, like PlayButton. Every press used to call
+  // play(), which restarted the episode from 0:00 instead of pausing it.
+  const onPlay = () => {
+    if (isActive) return isPlaying ? pause() : resume();
+    return play(podcast as unknown as Track, (queue ?? [podcast]) as unknown as Track[]);
+  };
 
   return (
     <div

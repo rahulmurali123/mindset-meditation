@@ -23,6 +23,7 @@ import {
 } from '@/lib/seo';
 import { getShow } from '@/lib/show';
 import { createPublicClient } from '@/lib/supabase/public';
+import { throwIfUnavailable } from '@/lib/supabase/errors';
 import {
   ArrowRight,
   BadgeCheck,
@@ -38,6 +39,7 @@ import {
 import type { Metadata } from 'next';
 import Image from 'next/image';
 import Link from 'next/link';
+import { formatSiteDate } from '@/lib/utils';
 
 export const revalidate = 300;
 
@@ -54,13 +56,7 @@ const HERO_PROOF = [
 
 const EPISODE_BADGES = ['Sleep', 'Mindfulness', 'Relaxation'];
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-function formatDate(iso: string) {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
-}
+const formatDate = formatSiteDate;
 
 /** Eyebrow + heading + optional right-hand action, shared by every section. */
 function SectionHeading({
@@ -161,7 +157,9 @@ function EpisodeCard({ episode, badge }: { episode: DatedEpisode; badge: string 
 
       <div className="mt-3 flex flex-1 flex-col sm:mt-4">
         <div className="flex items-center gap-2 text-[10px] font-medium uppercase tracking-[0.14em] text-foreground/40 sm:text-[11px]">
-          <span className="truncate">{formatDate(episode.created_at)}</span>
+          <span className="truncate">
+            {formatDate(episode.published_at ?? episode.created_at)}
+          </span>
           <span className="h-1 w-1 shrink-0 rounded-full bg-foreground/25" />
           <span className="shrink-0 tabular-nums">{formatDuration(episode.duration_seconds)}</span>
         </div>
@@ -213,13 +211,16 @@ export async function generateMetadata(): Promise<Metadata> {
 export default async function HomePage() {
   const supabase = createPublicClient();
 
-  const [show, { data: latestRows }] = await Promise.all([
+  const [show, { data: latestRows, error: latestError }] = await Promise.all([
     getShow(),
     supabase
       .from('tracks')
       .select(PODCAST_SELECT)
       .eq('status', 'published')
       .is('deleted_at', null)
+      // Publish date, like /episodes and the feed: an episode drafted early and
+      // published today is the newest one, not one from weeks ago.
+      .order('published_at', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(6),
   ]);
@@ -229,6 +230,7 @@ export default async function HomePage() {
   // so each card linked to /podcast/playlists (a 404) and the same fake URL was
   // written three times into the PodcastSeries JSON-LD. An empty catalogue now
   // shows an empty state, and one published episode shows that episode.
+  throwIfUnavailable('home', latestError);
   const episodesToShow = (latestRows ?? []) as DatedEpisode[];
   const latestEpisodes = episodesToShow;
   const hasLiveEpisodes = episodesToShow.length > 0;

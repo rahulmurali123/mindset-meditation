@@ -14,15 +14,28 @@ export default async function AdminCommentsPage() {
 
   // The admin RLS policy on comments already exposes every comment, including
   // those on unpublished episodes — see comments_select in fullschema.sql.
+  const SELECT =
+    'id, body, created_at, user_id, parent_id, track:tracks(id, title, slug), author:profiles(full_name, username, email)';
   const { data } = await supabase
     .from('comments')
-    .select(
-      'id, body, created_at, user_id, parent_id, track:tracks(id, title, slug), author:profiles(full_name, username, email)',
-    )
+    .select(SELECT)
     .order('created_at', { ascending: false })
     .limit(300);
+  const recent = (data ?? []) as unknown as ModCommentRow[];
 
-  const rows: ModRow[] = ((data ?? []) as unknown as ModCommentRow[]).map((c) => ({
+  // A reply only renders under its thread's root. When a new reply lands on an
+  // older thread whose root is outside the newest 300, the root was missing
+  // and the reply — possibly the one that needs removing — never showed up.
+  const present = new Set(recent.map((c) => c.id));
+  const missingRoots = [
+    ...new Set(recent.map((c) => c.parent_id).filter((id): id is string => !!id && !present.has(id))),
+  ];
+  const { data: roots } = missingRoots.length
+    ? await supabase.from('comments').select(SELECT).in('id', missingRoots)
+    : { data: [] };
+
+  const all = [...recent, ...((roots ?? []) as unknown as ModCommentRow[])];
+  const rows: ModRow[] = all.map((c) => ({
     id: c.id,
     body: c.body,
     created_at: c.created_at,

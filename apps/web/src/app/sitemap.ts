@@ -1,6 +1,7 @@
 import type { MetadataRoute } from 'next';
 import { SITE_URL } from '@/lib/seo';
 import { createPublicClient } from '@/lib/supabase/public';
+import { throwIfUnavailable } from '@/lib/supabase/errors';
 
 /**
  * Every indexable URL: the homepage, the episode and playlist indexes, each
@@ -32,7 +33,10 @@ type PlaylistRow = {
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   const supabase = createPublicClient();
 
-  const [{ data: episodeRows }, { data: playlistRows }] = await Promise.all([
+  const [
+    { data: episodeRows, error: episodeError },
+    { data: playlistRows, error: playlistError },
+  ] = await Promise.all([
     supabase
       .from('tracks')
       .select('slug, updated_at, published_at, thumbnail_url')
@@ -44,11 +48,15 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
       .from('playlists')
       .select('slug, updated_at, thumbnail_url')
       .eq('is_public', true)
+      // Only playlists with a published episode: an empty or draft-only one
+      // (e.g. created inline from the upload form) is not public content yet.
+      .gt('track_count', 0)
       .is('deleted_at', null)
       .not('slug', 'is', null)
       .limit(1000),
   ]);
 
+  throwIfUnavailable('sitemap', episodeError ?? playlistError);
   const episodes = (episodeRows ?? []) as EpisodeRow[];
   const playlists = (playlistRows ?? []) as PlaylistRow[];
 

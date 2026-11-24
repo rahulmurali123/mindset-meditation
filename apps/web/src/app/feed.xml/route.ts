@@ -8,9 +8,11 @@
  * for months — see that route for the reasoning.
  */
 import { createPublicClient } from '@/lib/supabase/public';
+import { throwIfUnavailable } from '@/lib/supabase/errors';
 import { SITE_URL } from '@/lib/seo';
 import { BRAND } from '@/lib/brand';
 import { getShow } from '@/lib/show';
+import { audioMimeType } from '@/lib/podcast';
 
 export const revalidate = 3600;
 
@@ -22,6 +24,7 @@ type FeedRow = {
   description: string | null;
   duration_seconds: number;
   file_size_bytes: number | null;
+  audio_path: string | null;
   thumbnail_url: string | null;
   instructor_name: string | null;
   published_at: string | null;
@@ -52,12 +55,12 @@ function itunesDuration(seconds: number): string {
 export async function GET() {
   const supabase = createPublicClient();
 
-  const [show, { data }] = await Promise.all([
+  const [show, { data, error }] = await Promise.all([
     getShow(),
     supabase
       .from('tracks')
       .select(
-        'title, slug, excerpt, short_description, description, duration_seconds, file_size_bytes, thumbnail_url, instructor_name, published_at, created_at, keywords',
+        'title, slug, excerpt, short_description, description, duration_seconds, file_size_bytes, audio_path, thumbnail_url, instructor_name, published_at, created_at, keywords',
       )
       .eq('status', 'published')
       .is('deleted_at', null)
@@ -65,6 +68,7 @@ export async function GET() {
       .limit(300),
   ]);
 
+  throwIfUnavailable('feed', error);
   const episodes = (data ?? []) as FeedRow[];
   const cover = show.coverUrl ?? `${SITE_URL}/hero-top.png`;
   const updated = episodes[0]?.published_at ?? episodes[0]?.created_at ?? new Date().toISOString();
@@ -87,7 +91,7 @@ export async function GET() {
       <itunes:explicit>false</itunes:explicit>${
         e.thumbnail_url ? `\n      <itunes:image href="${xml(e.thumbnail_url)}" />` : ''
       }${e.keywords?.length ? `\n      <itunes:keywords>${xml(e.keywords.join(', '))}</itunes:keywords>` : ''}
-      <enclosure url="${xml(audioUrl)}" type="audio/mpeg" length="${e.file_size_bytes ?? 0}" />
+      <enclosure url="${xml(audioUrl)}" type="${audioMimeType(e.audio_path)}" length="${e.file_size_bytes ?? 0}" />
     </item>`;
     })
     .join('\n');

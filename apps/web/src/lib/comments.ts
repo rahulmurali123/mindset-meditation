@@ -1,6 +1,8 @@
 // Shared comment helpers used by both the listener thread and the admin
 // moderation list, so the two can't drift apart.
 
+import { formatSiteDate } from '@/lib/utils';
+
 export interface ThreadedComment {
   id: string;
   created_at: string;
@@ -47,16 +49,8 @@ export function commentAuthorName(author: CommentRow['author']): string {
  * reads the runtime's defaults, which differ between the Node server and the
  * visitor's browser — that mismatch breaks hydration.
  */
-const DATE_FORMAT = new Intl.DateTimeFormat('en-US', {
-  month: 'short',
-  day: 'numeric',
-  year: 'numeric',
-  timeZone: 'UTC',
-});
-
 export function formatCommentDate(iso: string): string {
-  const date = new Date(iso);
-  return Number.isNaN(date.getTime()) ? '' : DATE_FORMAT.format(date);
+  return formatSiteDate(iso);
 }
 
 /**

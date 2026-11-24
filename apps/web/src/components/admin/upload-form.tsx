@@ -5,14 +5,14 @@ import { CoverArtField } from '@/components/admin/cover-art-field';
 import { PlatformLinkFields } from '@/components/admin/platform-link-fields';
 import { SeoFields, type SeoOverrides } from '@/components/admin/seo-fields';
 import type { PlatformLinks } from '@/lib/platforms';
-import { BUCKETS, MAX_AUDIO_BYTES, TRACK_LIMITS } from '@/lib/podcast';
+import { BUCKETS, MAX_AUDIO_BYTES, TRACK_LIMITS, formatBytes } from '@/lib/podcast';
 import { ACTION_FAILED, runAction } from '@/lib/run-action';
 import { type PodcastClient, createClient } from '@/lib/supabase/client';
 import { cn } from '@/lib/utils';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Check, CheckCircle2, ListMusic, Loader2, Music, Plus, UploadCloud, X } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { type FormEvent, type ReactNode, useState } from 'react';
+import { type FormEvent, type ReactNode, useEffect, useState } from 'react';
 import { toast } from 'sonner';
 
 export const INPUT =
@@ -74,8 +74,10 @@ export function readDuration(file: File): Promise<number> {
       settle(() => resolve(Math.round(seconds)));
     };
 
-    // A decoder that never answers would otherwise leave the form waiting forever.
-    const timer = setTimeout(() => fail('timed out reading the file'), 20_000);
+    // A decoder that never answers would otherwise leave the form waiting
+    // forever. Generous, because a multi-hour recording without a duration in
+    // its header (WebM, some M4A) is scanned end to end before it reports one.
+    const timer = setTimeout(() => fail('timed out reading the file'), 90_000);
 
     audio.onloadedmetadata = () => {
       // Recorder output (WebM, some M4A) has no duration in its header, so the
@@ -151,6 +153,23 @@ export function readBlurDataUrl(file: File): Promise<string | null> {
   });
 }
 
+/** A failed transfer, with the HTTP status when the server answered at all. */
+class UploadError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * A request that has sent nothing for this long is treated as dead. Without
+ * it, a connection that silently stalled (Wi-Fi handover, laptop sleep) left
+ * the upload at the same percentage forever with no error and no retry.
+ */
+const STALL_MS = 90_000;
+
 /**
  * PUT/POST a blob with real progress. fetch() can't report upload progress.
  *
@@ -168,24 +187,63 @@ function uploadWithProgress(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let stall: ReturnType<typeof setTimeout> | undefined;
+    const arm = () => {
+      clearTimeout(stall);
+      stall = setTimeout(() => {
+        xhr.abort();
+        reject(new UploadError('The upload stalled — no data moved for 90 seconds', 0));
+      }, STALL_MS);
+    };
+
     xhr.open(opts.method, url);
     for (const [k, v] of Object.entries(opts.headers)) xhr.setRequestHeader(k, v);
     xhr.upload.onprogress = (e) => {
+      arm();
       if (e.lengthComputable) opts.onProgress(e.loaded);
     };
-    xhr.onload = () =>
-      xhr.status >= 200 && xhr.status < 300
-        ? resolve()
-        : reject(new Error(`Upload failed (${xhr.status}) ${xhr.responseText.slice(0, 140)}`));
-    xhr.onerror = () =>
-      reject(new Error('Network error during upload — check the storage bucket CORS settings'));
+    xhr.onload = () => {
+      clearTimeout(stall);
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else
+        reject(
+          new UploadError(
+            `Upload failed (${xhr.status}) ${xhr.responseText.slice(0, 140)}`,
+            xhr.status,
+          ),
+        );
+    };
+    xhr.onerror = () => {
+      clearTimeout(stall);
+      reject(
+        new UploadError(
+          navigator.onLine
+            ? 'Network error during upload — check the storage bucket CORS settings'
+            : 'Lost the internet connection during upload',
+          0,
+        ),
+      );
+    };
+    arm();
     xhr.send(body);
   });
 }
 
+/** Resolves once the browser reports a connection again (immediately if it has one). */
+function untilOnline(): Promise<void> {
+  if (navigator.onLine) return Promise.resolve();
+  return new Promise((resolve) => window.addEventListener('online', () => resolve(), { once: true }));
+}
+
 /** How many parts are in flight at once. Past this, they just contend. */
 const PART_CONCURRENCY = 5;
-const PART_RETRIES = 2;
+/**
+ * Attempts per part before the upload gives up. A multi-hour episode spends a
+ * long time in flight, and two quick retries meant one dropped connection
+ * threw away everything sent so far. Backoff is capped at 30 s, and a part
+ * waits for the connection to come back before it counts an attempt.
+ */
+const PART_RETRIES = 8;
 
 /**
  * Uploads `file` in parallel chunks against pre-signed part URLs.
@@ -200,7 +258,9 @@ async function uploadParts(
   partUrls: string[],
   partSize: number,
   onProgress: (pct: number) => void,
+  resign: (partNumber: number) => Promise<string>,
 ): Promise<void> {
+  const urls = [...partUrls];
   const loaded = new Array<number>(partUrls.length).fill(0);
   const report = () => {
     const total = loaded.reduce((a, b) => a + b, 0);
@@ -208,9 +268,12 @@ async function uploadParts(
   };
 
   let next = 0;
+  // Once one part has failed for good the upload is aborted, so the other
+  // workers stop instead of sending parts R2 will no longer accept.
+  let failed = false;
 
   async function worker() {
-    while (true) {
+    while (!failed) {
       const index = next++;
       if (index >= partUrls.length) return;
 
@@ -218,7 +281,7 @@ async function uploadParts(
 
       for (let attempt = 0; ; attempt++) {
         try {
-          await uploadWithProgress(partUrls[index], chunk, {
+          await uploadWithProgress(urls[index], chunk, {
             method: 'PUT',
             // Content-Type is fixed by the signature; setting it per part would
             // invalidate it.
@@ -242,9 +305,19 @@ async function uploadParts(
           // episode, with a full green progress bar and no error anywhere.
           break;
         } catch (err) {
-          if (attempt >= PART_RETRIES) throw err;
+          if (attempt >= PART_RETRIES || failed) {
+            failed = true;
+            throw err;
+          }
           loaded[index] = 0;
-          await new Promise((r) => setTimeout(r, 400 * 2 ** attempt));
+          report();
+          await untilOnline();
+          await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
+          // R2 answers 403 to a URL that has expired or been refused; any
+          // other failure keeps the URL, which is still good.
+          if (err instanceof UploadError && (err.status === 403 || err.status === 400)) {
+            urls[index] = await resign(index + 1).catch(() => urls[index]);
+          }
         }
       }
     }
@@ -315,21 +388,48 @@ export async function uploadAudio(
   if (presign.backend === 'r2' && presign.mode === 'multipart') {
     opts.onStatus('Uploading to Cloudflare R2 (parallel)…');
     try {
-      await uploadParts(file, presign.partUrls, presign.partSize, opts.onProgress);
-      opts.onStatus('Finalising upload…');
-      const done = await fetch('/api/admin/upload-url', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'complete',
-          key: presign.key,
-          uploadId: presign.uploadId,
-          // How many parts R2 must be holding. The server refuses to assemble a
-          // short manifest, so a dropped part fails the upload instead of
-          // publishing a truncated file.
-          expectedParts: presign.partUrls.length,
-        }),
+      await uploadParts(file, presign.partUrls, presign.partSize, opts.onProgress, async (n) => {
+        const res = await fetch('/api/admin/upload-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'sign-part',
+            key: presign.key,
+            uploadId: presign.uploadId,
+            partNumber: n,
+          }),
+        });
+        const signed = await readJson(res);
+        if (!res.ok || typeof signed.url !== 'string') throw new Error('Could not re-sign part');
+        return signed.url;
       });
+      opts.onStatus('Finalising upload…');
+      const complete = () =>
+        fetch('/api/admin/upload-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'complete',
+            key: presign.key,
+            uploadId: presign.uploadId,
+            // How many parts R2 must be holding. The server refuses to assemble a
+            // short manifest, so a dropped part fails the upload instead of
+            // publishing a truncated file.
+            expectedParts: presign.partUrls.length,
+          }),
+        });
+      // Every byte is in R2 by now, so a dropped connection or a proxy blip on
+      // this one small request must not throw the whole upload away.
+      let done: Response | null = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (attempt > 0) {
+          await untilOnline();
+          await new Promise((r) => setTimeout(r, 2000 * attempt));
+        }
+        done = await complete().catch(() => null);
+        if (done && done.status !== 502 && done.status !== 503 && done.status !== 504) break;
+      }
+      if (!done) throw new Error('Could not reach the server to finalise the upload');
       const result = await readJson(done);
       if (!done.ok) throw new Error(String(result.error || 'Could not finalise the upload'));
       return result.audioPath as string;
@@ -373,6 +473,22 @@ export async function uploadAudio(
     },
   );
   return presign.audioPath as string;
+}
+
+/**
+ * Asks before the tab is closed or reloaded while `active`. A long episode can
+ * take a good while to upload, and leaving the page silently discarded it.
+ */
+export function useWarnBeforeLeaving(active: boolean) {
+  useEffect(() => {
+    if (!active) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [active]);
 }
 
 export function Field({
@@ -621,6 +737,7 @@ export function UploadForm({
   // Read as soon as an audio file is picked so the SEO preview can quote a real
   // length rather than waiting until submit.
   const [audioDuration, setAudioDuration] = useState(0);
+  useWarnBeforeLeaving(busy);
 
   function reset() {
     setDone(null);
@@ -665,7 +782,7 @@ export function UploadForm({
     }
     if (audio.size > MAX_AUDIO_BYTES) {
       toast.error(
-        `That file is ${(audio.size / 1024 / 1024).toFixed(0)} MB — the limit is ${MAX_AUDIO_BYTES / 1024 / 1024} MB. Export it at a lower bitrate.`,
+        `That file is ${formatBytes(audio.size)} — the limit is ${formatBytes(MAX_AUDIO_BYTES)}. Export it as MP3.`,
       );
       return;
     }
@@ -816,7 +933,7 @@ export function UploadForm({
                 .then(setAudioDuration)
                 .catch(() => setAudioDuration(0));
           }}
-          hint="MP3, up to 200MB"
+          hint="MP3, M4A, WAV, OGG or FLAC — long episodes (3 h+) are fine"
         />
       </Field>
 

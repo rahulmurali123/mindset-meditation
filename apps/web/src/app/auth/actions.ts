@@ -3,14 +3,22 @@
 // Auth server actions. Sign-in runs here rather than in the browser so that a
 // username can be resolved to its email without ever sending that email to the
 // client (which would turn the login form into an email-harvesting endpoint).
-import { cookies } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 import { createClient } from '@/lib/supabase/server';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { ADMIN_COOKIE, codeMatches, issueToken, verificationCode } from '@/lib/admin-verify';
+import {
+  ADMIN_COOKIE,
+  adminCookieOptions,
+  codeMatches,
+  issueToken,
+  verificationCode,
+} from '@/lib/admin-verify';
 import { SESSION_ONLY_COOKIE } from '@/lib/supabase/cookie-options';
 import { sendMail, smtpConfigured, passwordResetEmail, explainSmtpError } from '@/lib/mailer';
 import { SITE_URL } from '@/lib/seo';
 import { SERVICE_UNAVAILABLE, logSupabaseError } from '@/lib/supabase/errors';
+import { clientIp, rateLimit, waitText } from '@/lib/rate-limit';
+import { forgetAdminSession, recordAdminSession, sessionIdFromToken } from '@/lib/admin-session';
 
 const USERNAME_RE = /^[a-z0-9_]{3,20}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -31,6 +39,32 @@ function text(value: unknown): string {
 const MAX_CODE_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
 const failedAttempts = new Map<string, { count: number; at: number }>();
+
+const HOUR = 60 * 60 * 1000;
+
+/**
+ * Per-IP and per-account throttles for the unauthenticated actions.
+ *
+ * Supabase rate-limits its own auth endpoints, but these actions call it with
+ * the SERVICE ROLE (createUser, generateLink), which is exempt — so without a
+ * limit here the sign-up form created accounts as fast as a script could post,
+ * and "forgot password" would email any address on repeat through our own SMTP
+ * account, burning its quota and its sender reputation.
+ */
+function throttled(
+  scope: string,
+  rules: Array<{ key: string; limit: number; windowMs: number }>,
+): string | null {
+  for (const rule of rules) {
+    const { limited, retryAfterMs } = rateLimit(scope, rule.key, rule.limit, rule.windowMs);
+    if (limited) return `Too many attempts. Please wait ${waitText(retryAfterMs)} and try again.`;
+  }
+  return null;
+}
+
+async function ipKey(): Promise<string> {
+  return `ip:${clientIp(await headers())}`;
+}
 
 export interface AuthResult {
   error?: string;
@@ -57,12 +91,23 @@ export async function signUpAction(input: {
       field: 'username',
     };
   }
-  if (!EMAIL_RE.test(email)) {
+  if (!EMAIL_RE.test(email) || email.length > 254) {
     return { error: 'Enter a valid email address.', field: 'email' };
   }
   if (password.length < 8) {
     return { error: 'Password must be at least 8 characters.', field: 'password' };
   }
+  // bcrypt, which Supabase hashes with, ignores everything past 72 bytes.
+  if (new TextEncoder().encode(password).length > 72) {
+    return { error: 'Password must be at most 72 characters.', field: 'password' };
+  }
+
+  // Lookups are cheap and a person may try several taken usernames in a row;
+  // only an actual account creation (below) spends the tight 5-an-hour budget.
+  // Charging every attempt locked people out after five taken names.
+  const ip = await ipKey();
+  const lookupsLimited = throttled('signup-check', [{ key: ip, limit: 40, windowMs: HOUR }]);
+  if (lookupsLimited) return { error: lookupsLimited };
 
   const admin = createAdminClient();
 
@@ -93,6 +138,9 @@ export async function signUpAction(input: {
       field: 'email',
     };
   }
+
+  const limited = throttled('signup', [{ key: ip, limit: 5, windowMs: HOUR }]);
+  if (limited) return { error: limited };
 
   // Created with the service role and `email_confirm: true`, which marks the
   // address as already verified. No confirmation email, no waiting — the user
@@ -141,13 +189,32 @@ export async function signInAction(input: {
 
   if (!identifier) return { error: 'Enter your username or email.', field: 'identifier' };
   if (!password) return { error: 'Enter your password.', field: 'password' };
+  if (identifier.length > 254) {
+    return { error: 'Incorrect username/email or password.', field: 'identifier' };
+  }
+
+  // Per IP, and per account *from that IP*: a credential-stuffing run spreads
+  // one password list across many addresses, a targeted guess spreads many
+  // passwords across one account. The account limit used to be global, so
+  // anyone who knew the admin's email could send a few junk sign-ins every 15
+  // minutes and keep the real admin locked out with the right password.
+  // Guessing spread over many IPs is left to Supabase Auth's own limits.
+  const ip = await ipKey();
+  const limited = throttled('signin', [
+    { key: ip, limit: 30, windowMs: 15 * 60 * 1000 },
+    { key: `id:${identifier.toLowerCase()}:${ip}`, limit: 10, windowMs: 15 * 60 * 1000 },
+  ]);
+  if (limited) return { error: limited };
 
   // Written before signInWithPassword so the auth cookies it is about to set
   // are already subject to it — see lib/supabase/cookie-options.ts.
   const store = await cookies();
   if (input?.remember === false) {
+    // Readable by the browser on purpose: the browser client rewrites the auth
+    // cookies itself on token refresh and has to know to keep them
+    // session-only (lib/supabase/client.ts). It is a preference, not a secret.
     store.set(SESSION_ONLY_COOKIE, '1', {
-      httpOnly: true,
+      httpOnly: false,
       sameSite: 'lax',
       secure: process.env.NODE_ENV === 'production',
       path: '/',
@@ -205,7 +272,8 @@ export async function signInAction(input: {
     const message = error.message.toLowerCase();
     if (message.includes('not confirmed')) {
       return {
-        error: 'Confirm your email first — check your inbox for the verification link.',
+        error:
+          'This account has not been verified. Use "Forgot password" to get a sign-in link by email.',
         field: 'identifier',
       };
     }
@@ -298,14 +366,20 @@ export async function verifyAdminCodeAction(input: { code: string }): Promise<Au
   failedAttempts.delete(user.id);
 
   const token = await issueToken(user.id);
+
+  // The database half of the second factor: is_admin() only honours sessions
+  // recorded here (migration 038). Without this row the admin UI would load
+  // but every admin read and write would be refused by RLS.
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const sessionId = sessionIdFromToken(session?.access_token);
+  if (!sessionId || !(await recordAdminSession(user.id, sessionId, token.maxAge))) {
+    return { error: SERVICE_UNAVAILABLE, field: 'code' };
+  }
+
   const store = await cookies();
-  store.set(ADMIN_COOKIE, token.value, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    path: '/',
-    maxAge: token.maxAge,
-  });
+  store.set(ADMIN_COOKIE, token.value, adminCookieOptions(token.maxAge));
 
   return { ok: true };
 }
@@ -324,18 +398,31 @@ export async function verifyAdminCodeAction(input: { code: string }): Promise<Au
  * picture entirely, which is what otherwise forces the link to be opened in
  * the exact browser that requested it.
  */
+const RESET_UNAVAILABLE =
+  "We couldn't send the reset email right now. Please try again in a few minutes, or use the contact form if it keeps happening.";
+
 export async function requestPasswordResetAction(input: {
   email: string;
 }): Promise<AuthResult & { deliveryFailed?: boolean }> {
   const email = text(input?.email).toLowerCase();
-  if (!EMAIL_RE.test(email)) return { error: 'Enter a valid email address.', field: 'email' };
+  if (!EMAIL_RE.test(email) || email.length > 254) {
+    return { error: 'Enter a valid email address.', field: 'email' };
+  }
 
+  const limited = throttled('reset', [
+    { key: await ipKey(), limit: 10, windowMs: HOUR },
+    { key: `email:${email}`, limit: 3, windowMs: HOUR },
+  ]);
+  if (limited) return { error: limited, field: 'email' };
+
+  // Server set-up details go to the log, never to this public form: a
+  // visitor has no use for env var names, and the provider's own error text
+  // can name the owner's inbox.
   if (!smtpConfigured()) {
-    return {
-      error:
-        'Email delivery is not configured on the server yet, so the reset link cannot be sent. Set SMTP_HOST, SMTP_USER, SMTP_PASS and SMTP_FROM in .env, then run `pnpm smtp:test -- --to you@example.com` to check them — see SETUP.md.',
-      deliveryFailed: true,
-    };
+    console.error(
+      '[auth] password reset requested but SMTP is not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS and SMTP_FROM (see SETUP.md).',
+    );
+    return { error: RESET_UNAVAILABLE, deliveryFailed: true };
   }
 
   const admin = createAdminClient();
@@ -363,12 +450,12 @@ export async function requestPasswordResetAction(input: {
   try {
     await sendMail({ to: email, ...passwordResetEmail(link) });
   } catch (err) {
-    // A send failure is a server misconfiguration, not a fact about this
-    // address, so surfacing the real reason leaks nothing and saves a lot of
-    // guesswork. explainSmtpError maps the provider's own response to the
-    // setting that needs changing.
-    console.error('[auth] password reset email failed to send:', err);
-    return { error: explainSmtpError(err), deliveryFailed: true };
+    // explainSmtpError maps the provider's response to the setting that needs
+    // changing — for the server log. The visitor gets a neutral message: the
+    // raw text exposed SMTP host and env names, and an error that only
+    // registered addresses could trigger told anyone the account existed.
+    console.error('[auth] password reset email failed to send:', explainSmtpError(err), err);
+    return { error: RESET_UNAVAILABLE, deliveryFailed: true };
   }
 
   return { ok: true };
@@ -380,6 +467,14 @@ export async function requestPasswordResetAction(input: {
  * required again.
  */
 export async function clearAdminVerification(): Promise<void> {
+  // Revoke this session's admin rights in the database too, before the
+  // session itself is signed out.
+  const supabase = await createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  await forgetAdminSession(sessionIdFromToken(session?.access_token)).catch(() => {});
+
   const store = await cookies();
   store.delete(ADMIN_COOKIE);
   store.delete(SESSION_ONLY_COOKIE);

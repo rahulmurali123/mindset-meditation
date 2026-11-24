@@ -16,6 +16,8 @@ import {PodcastCard} from '@/components/podcast/podcast-card';
 import { Reveal, RevealGroup, RevealItem } from '@/components/ui/reveal';
 import { PlatformButtons } from '@/components/podcast/platform-buttons';
 import { createClient } from '@/lib/supabase/server';
+import { createAdminClient } from '@/lib/supabase/admin';
+import { throwIfUnavailable } from '@/lib/supabase/errors';
 import { PODCAST_SELECT, formatDuration, type EpisodeSummary } from '@/lib/podcast';
 import { FALLBACK_COVER_GRADIENT } from '@/lib/fallback-cover';
 import { BRAND } from '@/lib/brand';
@@ -42,7 +44,7 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { slug } = await params;
   const supabase = await createClient();
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('tracks')
     .select(
       'title, meta_description, short_description, description, thumbnail_url, created_at, published_at, duration_seconds, keywords',
@@ -50,6 +52,8 @@ export async function generateMetadata({
     .eq('slug', slug)
     .maybeSingle();
 
+  // An outage is not a missing episode — see the page body below.
+  throwIfUnavailable('episode', error);
   if (!data) return { title: 'Session not found' };
 
   const minutes = Math.max(1, Math.round((data.duration_seconds ?? 0) / 60));
@@ -111,11 +115,14 @@ export default async function PodcastPage({ params }: { params: Promise<{ slug: 
   const { slug } = await params;
   const supabase = await createClient();
 
-  const { data: podcast } = await supabase
+  const { data: podcast, error: podcastError } = await supabase
     .from('tracks')
     .select(PODCAST_SELECT)
     .eq('slug', slug)
     .maybeSingle();
+  // A failed read is an outage, not a missing episode — a 404 would tell
+  // search engines a live episode was deleted.
+  throwIfUnavailable('episode', podcastError);
   if (!podcast) notFound();
 
   // biome-ignore lint/suspicious/noExplicitAny: untyped podcast schema row
@@ -129,9 +136,7 @@ export default async function PodcastPage({ params }: { params: Promise<{ slug: 
     await Promise.all([
       supabase
         .from('comments')
-        .select(
-          'id, body, created_at, user_id, parent_id, author:profiles(full_name, username, email)',
-        )
+        .select('id, body, created_at, user_id, parent_id')
         .eq('track_id', p.id)
         .order('created_at', { ascending: false })
         .limit(200),
@@ -151,18 +156,34 @@ export default async function PodcastPage({ params }: { params: Promise<{ slug: 
 
   const viewerIsAdmin = viewerRole === 'admin' || viewerRole === 'super_admin';
 
-  // Which comment authors are staff — drives the "Host" badge.
-  // Reads profiles.role directly; the roles/user_roles join tables were
-  // collapsed into that column when the schema was consolidated.
+  // Author names and the "Host" badge. profiles_select_own lets a visitor read
+  // only their OWN profile, so the embedded author used to come back null for
+  // everyone else: every other comment said "Listener" and the host's replies
+  // carried no badge. Read with the service role instead, for exactly the
+  // authors on screen and exactly the two display columns plus role — never
+  // the email, which the old fallback turned into a public display name.
   const authorIds = [
     ...new Set(((commentRows ?? []) as Array<{ user_id: string }>).map((c) => c.user_id)),
   ];
-  const { data: staffRows } = authorIds.length
-    ? await supabase.from('profiles').select('id, role').in('id', authorIds)
+  const { data: authorRows } = authorIds.length
+    ? await createAdminClient()
+        .from('profiles')
+        .select('id, full_name, username, role')
+        .in('id', authorIds)
     : { data: [] };
 
+  const authors = new Map(
+    (
+      (authorRows ?? []) as Array<{
+        id: string;
+        full_name: string | null;
+        username: string | null;
+        role?: string | null;
+      }>
+    ).map((r) => [r.id, r]),
+  );
   const staffIds = new Set(
-    ((staffRows ?? []) as Array<{ id: string; role?: string | null }>)
+    [...authors.values()]
       .filter((r) => r.role === 'admin' || r.role === 'super_admin')
       .map((r) => r.id),
   );
@@ -172,7 +193,7 @@ export default async function PodcastPage({ params }: { params: Promise<{ slug: 
     body: c.body,
     created_at: c.created_at,
     parent_id: c.parent_id ?? null,
-    author: commentAuthorName(c.author),
+    author: commentAuthorName(authors.get(c.user_id)),
     mine: !!user && c.user_id === user.id,
     isAdmin: staffIds.has(c.user_id),
   }));
@@ -206,6 +227,7 @@ export default async function PodcastPage({ params }: { params: Promise<{ slug: 
             // generateMetadata above already resolves it this way.
             createdAt: p.published_at ?? p.created_at,
             hostName: p.instructor_name,
+            audioPath: p.audio_path,
             platforms,
           }),
           breadcrumbLd([

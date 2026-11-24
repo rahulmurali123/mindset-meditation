@@ -4,23 +4,18 @@
 // the password-reset flow uses (lib/mailer.ts). Reply-To is set to the sender,
 // so replying from the inbox goes straight back to them.
 import { BRAND } from '@/lib/brand';
+import { headers } from 'next/headers';
 import { explainSmtpError, sendMail, smtpConfigured } from '@/lib/mailer';
+import { clientIp, rateLimit } from '@/lib/rate-limit';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// In-process, per-instance throttle. Enough to blunt a form-spam script; for a
-// multi-instance deployment move this to a shared store.
+// Keyed by IP as well as by the address typed in: the email field is whatever
+// the sender says it is, so a limit on that alone was walked past by changing
+// one character per message.
 const WINDOW_MS = 60_000;
 const MAX_PER_WINDOW = 3;
-const hits = new Map<string, number[]>();
-
-function rateLimited(key: string): boolean {
-  const now = Date.now();
-  const recent = (hits.get(key) ?? []).filter((t) => now - t < WINDOW_MS);
-  recent.push(now);
-  hits.set(key, recent);
-  return recent.length > MAX_PER_WINDOW;
-}
+const MAX_PER_IP_PER_HOUR = 10;
 
 function escapeHtml(value: string): string {
   return value
@@ -48,7 +43,9 @@ export async function sendEnquiry(input: {
   const email = typeof input?.email === 'string' ? input.email.trim() : '';
   const message = typeof input?.message === 'string' ? input.message.trim() : '';
 
-  if (!EMAIL_RE.test(email)) return { error: 'Enter a valid email address.', field: 'email' };
+  if (!EMAIL_RE.test(email) || email.length > 254) {
+    return { error: 'Enter a valid email address.', field: 'email' };
+  }
   if (message.length < 10) {
     return { error: 'Tell us a little more (at least 10 characters).', field: 'message' };
   }
@@ -60,8 +57,12 @@ export async function sendEnquiry(input: {
     };
   }
 
-  if (rateLimited(email)) {
-    return { error: 'You have sent a few already — please wait a minute and try again.' };
+  const ip = clientIp(await headers());
+  if (
+    rateLimit('contact', `email:${email.toLowerCase()}`, MAX_PER_WINDOW, WINDOW_MS).limited ||
+    rateLimit('contact', `ip:${ip}`, MAX_PER_IP_PER_HOUR, 60 * 60_000).limited
+  ) {
+    return { error: 'You have sent a few already — please wait a while and try again.' };
   }
 
   const safeEmail = escapeHtml(email);

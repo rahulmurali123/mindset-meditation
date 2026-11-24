@@ -14,7 +14,7 @@ export function PodcastCard({
   podcast,
   queue,
 }: { podcast: EpisodeSummary; queue?: EpisodeSummary[] }) {
-  const { play } = useAudioPlayer();
+  const { play, pause, resume } = useAudioPlayer();
   const currentId = usePlayerStore((s) => s.currentTrack?.id);
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const isActive = currentId === podcast.id;
@@ -65,10 +65,12 @@ export function PodcastCard({
         {/* Play */}
         <button
           type="button"
-          onClick={() =>
-            play(podcast as unknown as Track, (queue ?? [podcast]) as unknown as Track[])
-          }
-          aria-label={`Play ${podcast.title}`}
+          onClick={() => {
+            // The active card toggles instead of restarting from 0:00.
+            if (isActive) return isPlaying ? pause() : resume();
+            return play(podcast as unknown as Track, (queue ?? [podcast]) as unknown as Track[]);
+          }}
+          aria-label={isActive && isPlaying ? `Pause ${podcast.title}` : `Play ${podcast.title}`}
           className={cn(
             'absolute bottom-3 right-3 w-12 h-12 rounded-full grid place-items-center',
             'bg-primary text-white shadow-2xl glow-primary',

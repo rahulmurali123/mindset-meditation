@@ -92,13 +92,44 @@ const isDev = process.env.NODE_ENV === 'development';
  * R2, so https: is allowed for those fetches rather than pinning a host that
  * changes with the storage backend.
  */
+/**
+ * The configured Supabase origin, named explicitly as well. In production it is
+ * HTTPS and already covered by `https:`; a local stack is plain http://127.0.0.1,
+ * which `https:` does not match, so the browser could not reach it at all —
+ * every client-side upload and sign-in refresh failed with "Failed to fetch".
+ */
+function supabaseOrigin(): string {
+  try {
+    return ` ${new URL(process.env.NEXT_PUBLIC_SUPABASE_URL ?? '').origin}`;
+  } catch {
+    return '';
+  }
+}
+const sb = supabaseOrigin();
+
+function supabaseImagePattern() {
+  try {
+    const url = new URL(process.env.NEXT_PUBLIC_SUPABASE_URL ?? '');
+    return [
+      {
+        protocol: url.protocol.replace(':', '') as 'http' | 'https',
+        hostname: url.hostname,
+        port: url.port,
+        pathname: '/storage/v1/object/public/**',
+      },
+    ];
+  } catch {
+    return [];
+  }
+}
+
 const csp = [
   "default-src 'self'",
   `script-src 'self' 'unsafe-inline'${isDev ? " 'unsafe-eval'" : ''}`,
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob: https:",
-  "media-src 'self' blob: https:",
-  `connect-src 'self' https: wss:${isDev ? ' ws:' : ''}`,
+  `img-src 'self' data: blob: https:${sb}`,
+  `media-src 'self' blob: https:${sb}`,
+  `connect-src 'self' https: wss:${sb}${isDev ? ' ws:' : ''}`,
   "font-src 'self' data:",
   "worker-src 'self' blob:",
   "manifest-src 'self'",
@@ -148,6 +179,9 @@ const nextConfig: NextConfig = {
       // Cloudflare R2 public bucket / custom domain, when one is configured.
       { protocol: 'https', hostname: '*.r2.dev' },
       { protocol: 'https', hostname: '*.r2.cloudflarestorage.com' },
+      // Whatever Supabase this build points at — a self-hosted or local stack
+      // is not under *.supabase.co, and its covers would otherwise 400.
+      ...supabaseImagePattern(),
     ],
     formats: ['image/avif', 'image/webp'],
     // Artwork is immutable once uploaded (keys are content-addressed by

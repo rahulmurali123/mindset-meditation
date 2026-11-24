@@ -5,6 +5,7 @@ import type { Metadata } from 'next';
 import { BRAND } from '@/lib/brand';
 import type { ResolvedPlatform } from '@/lib/platforms';
 import { SITE_URL } from '@/lib/public-origin';
+import { audioMimeType } from '@/lib/podcast';
 
 export { SITE_URL };
 
@@ -224,6 +225,8 @@ export function episodeLd(episode: {
   thumbnailUrl?: string | null;
   createdAt?: string | null;
   hostName?: string | null;
+  /** Storage key of the audio, for its real MIME type. */
+  audioPath?: string | null;
   /** Where this specific episode can be heard off-site. */
   platforms?: ResolvedPlatform[];
 }) {
@@ -245,7 +248,7 @@ export function episodeLd(episode: {
       // page, which made the AudioObject claim an HTML document was an MP3.
       contentUrl: canonical(`/api/episode-audio/${episode.slug}`),
       duration: isoDuration(episode.durationSeconds),
-      encodingFormat: 'audio/mpeg',
+      encodingFormat: audioMimeType(episode.audioPath),
     },
     ...(episode.hostName
       ? { author: { '@type': 'Person', name: episode.hostName } }

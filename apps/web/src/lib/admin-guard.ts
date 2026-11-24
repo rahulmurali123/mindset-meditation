@@ -13,8 +13,15 @@
 import { cache } from 'react';
 import { cookies } from 'next/headers';
 import { createClient } from '@/lib/supabase/server';
-import { ADMIN_COOKIE, adminIsVerified } from '@/lib/admin-verify';
+import {
+  ADMIN_COOKIE,
+  adminCookieOptions,
+  adminIsVerified,
+  issueToken,
+  tokenExpiresAt,
+} from '@/lib/admin-verify';
 import { logSupabaseError } from '@/lib/supabase/errors';
+import { adminSessionLive, recordAdminSession, sessionIdFromToken } from '@/lib/admin-session';
 
 export type AdminDenial = 'unauthenticated' | 'forbidden' | 'unverified' | 'unavailable';
 
@@ -50,6 +57,17 @@ export const checkAdmin = cache(async (): Promise<AdminCheck> => {
   const verified = await adminIsVerified(store.get(ADMIN_COOKIE)?.value, user.id);
   if (!verified) return { ok: false, userId: user.id, reason: 'unverified' };
 
+  // The cookie must also be backed by a verified session in the database —
+  // otherwise RLS (is_admin(), migration 038) refuses every admin query and
+  // the dashboard would load empty. This is the case for a cookie issued
+  // before 038 was applied, so those admins are simply asked for the code again.
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const live = await adminSessionLive(user.id, sessionIdFromToken(session?.access_token));
+  if (live === 'unavailable') return { ok: false, userId: user.id, reason: 'unavailable' };
+  if (live === false) return { ok: false, userId: user.id, reason: 'unverified' };
+
   return { ok: true, userId: user.id };
 });
 
@@ -60,3 +78,36 @@ export const ADMIN_DENIAL_RESPONSE: Record<AdminDenial, { status: number; error:
   unverified: { status: 403, error: 'Admin verification required' },
   unavailable: { status: 503, error: 'Service unavailable' },
 };
+
+/**
+ * Below this much remaining verification, starting an upload renews it.
+ *
+ * The code is good for 12 hours from when it was entered, and every step of
+ * an upload — including the final "complete" after the last byte — is
+ * admin-gated. A 3-hour episode started at hour 11 used to transfer in full
+ * and then be refused at completion, discarding the whole file.
+ */
+const RENEW_BELOW_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Slides an already-verified admin's verification forward, so long work they
+ * have just started cannot outlive it. Call only after checkAdmin() passed —
+ * this never grants verification, it only extends one that is live.
+ * Best-effort: on any failure the existing verification simply stands.
+ */
+export async function renewAdminVerification(userId: string): Promise<void> {
+  const store = await cookies();
+  const expires = tokenExpiresAt(store.get(ADMIN_COOKIE)?.value);
+  if (expires !== null && expires - Date.now() > RENEW_BELOW_MS) return;
+
+  const supabase = await createClient();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+  const sessionId = sessionIdFromToken(session?.access_token);
+  if (!sessionId) return;
+
+  const token = await issueToken(userId);
+  if (!(await recordAdminSession(userId, sessionId, token.maxAge))) return;
+  store.set(ADMIN_COOKIE, token.value, adminCookieOptions(token.maxAge));
+}
